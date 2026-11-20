@@ -704,18 +704,18 @@ fn test_reentrancy_lock_blocks_concurrent_execution() {
 }
 
 #[test]
-fn test_max_batch_size_limit_is_thirty() {
+fn test_max_batch_size_limit_is_fifty() {
     let s = Setup::new();
-    assert_eq!(s.client.max_batch_size(), 30);
-    assert_eq!(crate::MAX_BATCH_LIMIT, 30);
-    assert_eq!(crate::MAX_BATCH_SIZE, 30);
+    assert_eq!(s.client.max_batch_size(), 50);
+    assert_eq!(crate::MAX_BATCH_LIMIT, 50);
+    assert_eq!(crate::MAX_BATCH_SIZE, 50);
 }
 
 // ── CPU / memory benchmark across batch sizes (issue #818) ──────────────────
 
-/// Batch sizes tracked by the benchmark. 40 and 50 are above `MAX_BATCH_SIZE`
-/// and are expected to be rejected up front, before any transfer.
-const BENCH_SIZES: [u32; 5] = [10, 20, 30, 40, 50];
+/// Batch sizes tracked by the benchmark. 60 is above `MAX_BATCH_SIZE`
+/// and is expected to be rejected up front, before any transfer.
+const BENCH_SIZES: [u32; 6] = [10, 20, 30, 40, 50, 60];
 
 /// Resource ceilings for `process_batch`, measured at the three accepted
 /// sizes (10: 1.85M, 20: 3.59M, 30: 5.45M CPU; 30: 0.80M memory) with ~25 %
@@ -837,6 +837,66 @@ fn batch_cancel_cancels_multiple_streams() {
     }
     assert_eq!(
         s.client.try_batch_cancel(&caller, &oversized),
+        Err(Ok(Error::BatchTooLarge))
+    );
+}
+
+
+// ── Issues #963-#964: partial/atomic cancel mode and explicit cap ───────────
+
+#[soroban_sdk::contract]
+pub struct CancelOkContract;
+
+#[soroban_sdk::contractimpl]
+impl CancelOkContract {
+    pub fn cancel(_env: Env, _caller: Address) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+#[soroban_sdk::contract]
+pub struct CancelFailContract;
+
+#[soroban_sdk::contractimpl]
+impl CancelFailContract {
+    pub fn cancel(_env: Env, _caller: Address) -> Result<(), Error> {
+        Err(Error::NotAuthorized)
+    }
+}
+
+#[test]
+fn batch_cancel_partial_reports_failure_and_continues() {
+    let s = Setup::new();
+    let caller = Address::generate(&s.env);
+    let ok = s.env.register_contract(None, CancelOkContract);
+    let fail = s.env.register_contract(None, CancelFailContract);
+
+    let mut streams = Vec::new(&s.env);
+    streams.push_back(ok);
+    streams.push_back(fail);
+    streams.push_back(s.env.register_contract(None, CancelOkContract));
+
+    let results = s.client.batch_cancel_with_mode(&caller, &streams, &true);
+    assert_eq!(results.len(), 3);
+    assert!(results.get(0).unwrap().success);
+    assert!(!results.get(1).unwrap().success);
+    assert_eq!(
+        results.get(1).unwrap().error_code,
+        Some(Error::NotAuthorized as u32)
+    );
+    assert!(results.get(2).unwrap().success);
+}
+
+#[test]
+fn batch_cancel_mode_rejects_more_than_fifty_items() {
+    let s = Setup::new();
+    let caller = Address::generate(&s.env);
+    let mut streams = Vec::new(&s.env);
+    for _ in 0..51 {
+        streams.push_back(Address::generate(&s.env));
+    }
+    assert_eq!(
+        s.client.try_batch_cancel_with_mode(&caller, &streams, &false),
         Err(Ok(Error::BatchTooLarge))
     );
 }
