@@ -13,8 +13,7 @@ use soroban_sdk::{contracttype, token, Address, Env};
 
 pub use drip_common::ttl::bump_instance as bump;
 
-/// Automated key and instance TTL extension helpers (Issue #762).
-
+// Automated key and instance TTL extension helpers (Issue #762).
 /// Bumps temporary storage key TTL to default thresholds.
 pub fn bump_temporary_key<K: soroban_sdk::IntoVal<Env, soroban_sdk::Val>>(env: &Env, key: &K) {
     env.storage().temporary().extend_ttl(
