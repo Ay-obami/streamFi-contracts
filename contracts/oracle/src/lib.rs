@@ -2552,9 +2552,13 @@ mod tests {
         client.submit_price(&admin, &1_000_000_000_000_000_000);
         assert_eq!(client.get_twap_price(), 1_000_000_000_000_000_000);
 
-        // Below the ceiling is allowed.
-        client.submit_price(&admin, &500_000_000);
-        assert_eq!(client.get_twap_price(), 500_000_000);
+        // A separate feeder's first report below the ceiling is also allowed.
+        // Using another feeder keeps this ceiling test independent of the
+        // per-feeder 50% volatility circuit breaker.
+        let feeder = Address::generate(&_env);
+        client.grant_role(&admin, &Role::PriceFeeder, &feeder);
+        assert!(client.try_submit_price(&feeder, &500_000_000).is_ok());
+        assert_eq!(client.latest_price().price, 500_000_000);
     }
 
     #[test]
@@ -3274,8 +3278,13 @@ mod tests {
 
         client.submit_price(&feeder_b, &20);
 
-        let price = client.get_twap_price();
-        assert_eq!(price, 20);
+        // The fresh feeder set now contains only feeder_b. The historical TWAP
+        // still retains the earlier 10-price observation for its valid time
+        // window, so verify freshness separately and inspect only the newest
+        // observation after it has accrued one second.
+        assert_eq!(client.price_status().fresh_submitter_count, 1);
+        env.ledger().set_timestamp(env.ledger().timestamp() + 1);
+        assert_eq!(client.get_twap_price_for_observations(&1), 20);
     }
 
     #[test]
@@ -3946,14 +3955,16 @@ mod tests {
             min_persistent_entry_ttl: 4096,
             max_entry_ttl: 6_312_000,
         });
-        let result = client.try_submit_price(&feeder, &200_000_000);
+        // Keep the update at the hard 50% deviation boundary so this test
+        // isolates the submit-interval rule rather than the volatility guard.
+        let result = client.try_submit_price(&feeder, &150_000_000);
         assert!(
             result.is_ok(),
             "submit after exactly min_submit_interval must succeed"
         );
 
         // The original $100 observation held for the elapsed minute; the new
-        // $200 observation has not accrued time yet.
+        // $150 observation has not accrued time yet.
         assert_eq!(client.get_twap_price(), 100_000_000);
     }
 
