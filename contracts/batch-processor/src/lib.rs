@@ -16,7 +16,7 @@ pub use ttl::MaintenanceReserve;
 /// Maximum number of transfers permitted in a single batch (Issue #677).
 ///
 /// Bounded to 50 to prevent transaction CPU and footprint budget exhaustion while still
-allowing payroll-sized batches to fail fast before any auth or token movement (Issue #964).
+/// allowing payroll-sized batches to fail fast before any auth or token movement (Issue #964).
 pub const MAX_BATCH_SIZE: u32 = 50;
 
 /// Maximum batch limit alias for MAX_BATCH_SIZE (Issue #677).
@@ -717,11 +717,7 @@ impl BatchTransferProcessor {
     ///
     /// Iterates through streams and invokes `cancel` on each in a single atomic transaction.
     /// Reclaims remaining deposit balances back to the authorized sender/caller.
-    pub fn batch_cancel(
-        env: Env,
-        caller: Address,
-        stream_ids: Vec<Address>,
-    ) -> Result<u32, Error> {
+    pub fn batch_cancel(env: Env, caller: Address, stream_ids: Vec<Address>) -> Result<u32, Error> {
         if stream_ids.len() > MAX_BATCH_SIZE {
             return Err(Error::BatchTooLarge);
         }
@@ -779,8 +775,7 @@ impl BatchTransferProcessor {
             args.push_back(caller.to_val());
 
             if !allow_partial {
-                let _: () =
-                    env.invoke_contract(&stream_id, &Symbol::new(&env, "cancel"), args);
+                let _: () = env.invoke_contract(&stream_id, &Symbol::new(&env, "cancel"), args);
                 results.push_back(BatchResult {
                     item_index: idx as u32,
                     success: true,
@@ -796,7 +791,11 @@ impl BatchTransferProcessor {
             );
             let (success, error_code) = match res {
                 Ok(Ok(())) => (true, None),
-                Ok(Err(err)) | Err(Ok(err)) => (false, Some(err.get_code())),
+                // The target returned a value that could not be converted to
+                // the expected unit return type. Treat it as an item failure
+                // in partial mode rather than aborting the whole batch.
+                Ok(Err(_)) => (false, Some(9998)),
+                Err(Ok(err)) => (false, Some(err.get_code())),
                 Err(Err(soroban_sdk::InvokeError::Contract(code))) => (false, Some(code)),
                 Err(Err(soroban_sdk::InvokeError::Abort)) => (false, Some(9999)),
             };
@@ -898,7 +897,10 @@ impl BatchTransferProcessor {
         env.storage().temporary().remove(&DataKey::ReentrancyLock);
 
         env.events().publish(
-            (Symbol::new(&env, "batch_withdrawn_lenient"), env.current_contract_address()),
+            (
+                Symbol::new(&env, "batch_withdrawn_lenient"),
+                env.current_contract_address(),
+            ),
             (results.len(), stream_ids.len()),
         );
 
@@ -906,10 +908,7 @@ impl BatchTransferProcessor {
     }
 
     /// Extend batch processor storage TTL to match target stream expiration (Issue #762).
-    pub fn bump_ttl_to_stream_expiration(
-        env: Env,
-        target_stream_ledger: u32,
-    ) {
+    pub fn bump_ttl_to_stream_expiration(env: Env, target_stream_ledger: u32) {
         ttl::bump_to_match_stream_expiration(&env, target_stream_ledger);
     }
 
@@ -939,11 +938,7 @@ impl BatchTransferProcessor {
     }
 
     /// Fund the batch processor maintenance reserve pool (Issue #817).
-    pub fn fund_maintenance_reserve(
-        env: Env,
-        funder: Address,
-        amount: i128,
-    ) -> Result<(), Error> {
+    pub fn fund_maintenance_reserve(env: Env, funder: Address, amount: i128) -> Result<(), Error> {
         ttl::fund_maintenance_reserve(&env, &funder, amount)?;
         Ok(())
     }
