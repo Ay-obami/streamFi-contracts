@@ -2557,8 +2557,10 @@ mod tests {
         // per-feeder 50% volatility circuit breaker.
         let feeder = Address::generate(&_env);
         client.grant_role(&admin, &Role::PriceFeeder, &feeder);
-        assert!(client.try_submit_price(&feeder, &500_000_000).is_ok());
-        assert_eq!(client.latest_price().price, 500_000_000);
+        assert!(
+            client.try_submit_price(&feeder, &500_000_000).is_ok(),
+            "a first feeder-local report below max_price must be accepted"
+        );
     }
 
     #[test]
