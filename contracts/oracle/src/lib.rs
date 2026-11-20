@@ -660,12 +660,27 @@ impl TwapOracle {
         // (identical to `max_price == 0`), so submission is not blocked — see
         // issue #226.
         let now = env.ledger().timestamp();
-
-        let last_price_deviation = env
+        let config = env
             .storage()
             .instance()
-            .get::<_, PriceData>(&DataKey::Price)
-            .filter(|last| last.price > 0)
+            .get::<_, OracleConfig>(&DataKey::Config);
+
+        // Deviation guards are feeder-local. Comparing a feeder's first report
+        // against another feeder's last global report incorrectly rejects valid
+        // cross-feeder medians. A stale report is also not a useful volatility
+        // anchor after a network partition, so only a caller's own fresh prior
+        // submission participates in the circuit breaker.
+        let last_price_deviation = env
+            .storage()
+            .persistent()
+            .get::<_, PriceData>(&DataKey::Submission(caller.clone()))
+            .filter(|last| {
+                last.price > 0
+                    && config
+                        .as_ref()
+                        .map(|cfg| now.saturating_sub(last.updated_at) <= cfg.max_staleness)
+                        .unwrap_or(true)
+            })
             .map(|last| {
                 (price.abs_diff(last.price) as u128)
                     .checked_mul(10_000)
@@ -681,11 +696,7 @@ impl TwapOracle {
             return Err(Error::OracleDeviationTooHigh);
         }
 
-        if let Some(config) = env
-            .storage()
-            .instance()
-            .get::<_, OracleConfig>(&DataKey::Config)
-        {
+        if let Some(config) = config {
             if config.max_price != 0 && price > config.max_price {
                 events::price_rejected(&env, &caller, price, symbol_short!("max_price"));
                 return Err(Error::PriceExceedsMaxPrice);
@@ -2622,10 +2633,11 @@ mod tests {
         client.configure_oracle(&admin, &config);
 
         client.submit_price(&admin, &50_000_000);
+        let submitted_at = env.ledger().timestamp();
 
         // A heartbeat exactly at the staleness boundary remains usable.
         env.ledger().set(LedgerInfo {
-            timestamp: 1_000_000 + 60,
+            timestamp: submitted_at + 60,
             protocol_version: 21,
             sequence_number: 1,
             network_id: Default::default(),
@@ -2640,7 +2652,7 @@ mod tests {
         // configured 60-second window. The read returns a stale-feed error
         // rather than panicking or reusing the old price.
         env.ledger().set(LedgerInfo {
-            timestamp: 1_000_000 + 61,
+            timestamp: submitted_at + 61,
             protocol_version: 21,
             sequence_number: 1,
             network_id: Default::default(),
@@ -3155,11 +3167,13 @@ mod tests {
         env.ledger().set_timestamp(100);
         client.submit_price(&admin, &100);
         env.ledger().set_timestamp(110);
-        client.submit_price(&admin, &200);
+        // Stay at the hard 50% per-feeder boundary so this TWAP test does not
+        // intentionally trip the volatility circuit breaker.
+        client.submit_price(&admin, &150);
         env.ledger().set_timestamp(140);
 
-        assert_eq!(client.get_twap_price(), 175);
-        assert_eq!(client.get_twap_price_for_observations(&1), 200);
+        assert_eq!(client.get_twap_price(), 137);
+        assert_eq!(client.get_twap_price_for_observations(&1), 150);
         assert_eq!(
             client.try_get_twap_price_for_observations(&0),
             Err(Ok(Error::InvalidObservationCount))
