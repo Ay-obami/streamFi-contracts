@@ -61,4 +61,10 @@ pub enum Error {
     StrategyNotApproved = 29,
     /// No untracked token excess is available for emergency recovery (#948).
     NothingToSweep = 30,
+    /// The vault balance cannot cover this withdrawal (#954). Distinct from a liquidity
+    /// shortfall at the token contract, which is `InsufficientVaultLiquidity`.
+    InsufficientVaultBalance = 210,
+    /// The caller is not an authorized vault operator (#954). Distinct from `NotAuthorized`,
+    /// which covers owner-only calls.
+    UnauthorizedOperator = 211,
 }

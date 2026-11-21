@@ -350,6 +350,12 @@ pub enum DataKey {
     /// `DataKey::StreamWasmHash`.
     WasmVersionHistory,
 
+    /// **Persistent storage.** Ledger sequence at which stream `id` was deployed (#956).
+    /// Key: `DataKey::StreamLedger(u64)` — the stream's unique ID
+    /// Value: `u32` — the ledger sequence at creation
+    /// Absent for streams deployed before this key was introduced.
+    StreamLedger(u64),
+
     // ── Deployment nonce (Issue #957) ───────────────────────────────────
     /// **Persistent storage.** Next deployment nonce for a sender. Mixed into
     /// the stream deployment salt so repeat deploys by one sender never collide.
