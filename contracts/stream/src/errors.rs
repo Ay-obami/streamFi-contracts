@@ -71,4 +71,6 @@ pub enum Error {
     /// `bump_long_term_stream_ttl` was called on a stream that is not an
     /// active multi-year schedule (#880).
     StreamNotLongTerm = 123,
+    NoRecipientProposal = 126,
+    RecipientProposalStale = 127,
 }

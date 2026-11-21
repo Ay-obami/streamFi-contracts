@@ -7,12 +7,17 @@ use std::boxed::Box;
 
 use soroban_sdk::{
     symbol_short,
-    testutils::{storage::Instance as _, Address as _, Events as _, Ledger, LedgerInfo},
+    testutils::{
+        storage::Instance as _, Address as _, Events as _, Ledger, LedgerInfo, MockAuth,
+        MockAuthInvoke,
+    },
     token, Address, Env, IntoVal, String, Symbol, TryFromVal, TryIntoVal,
 };
 
 use crate::{
-    storage::{DataKey, StreamInfo, FLAG_CANCELLED, FLAG_CLAWBACK_ENABLED, FLAG_PAUSED},
+    storage::{
+        DataKey, RecipientProposal, StreamInfo, FLAG_CANCELLED, FLAG_CLAWBACK_ENABLED, FLAG_PAUSED,
+    },
     DripStream, DripStreamClient, Error,
 };
 
@@ -188,6 +193,242 @@ fn transfer_recipient_rejects_ended_stream() {
 
     let result = s.client.try_transfer_recipient(&Address::generate(&s.env));
     assert_eq!(result, Err(Ok(Error::StreamEnded)));
+}
+
+#[test]
+fn propose_recipient_stores_pending_and_accept_transfers_control() {
+    let s = Setup::new(100, 3_600, false);
+    let new_recipient = Address::generate(&s.env);
+    let proposed_at = s.env.ledger().timestamp();
+
+    assert_eq!(s.client.pending_recipient(), None);
+    assert_eq!(s.client.recipient(), s.recipient);
+
+    s.client.propose_recipient(&new_recipient);
+
+    let proposal = s.client.recipient_proposal().unwrap();
+    assert_eq!(proposal.current_recipient, s.recipient);
+    assert_eq!(proposal.new_recipient, new_recipient);
+    assert_eq!(proposal.proposed_at, proposed_at);
+    assert_eq!(s.client.pending_recipient(), Some(new_recipient.clone()));
+    assert_eq!(s.client.recipient(), s.recipient);
+
+    s.client.accept_recipient();
+
+    assert_eq!(s.client.recipient(), new_recipient);
+    assert_eq!(s.client.recipient_proposal(), None);
+    assert_eq!(s.client.pending_recipient(), None);
+}
+
+#[test]
+fn recipient_ceremony_replaces_an_earlier_proposal() {
+    let s = Setup::new(100, 3_600, false);
+    let first = Address::generate(&s.env);
+    let second = Address::generate(&s.env);
+
+    s.client.propose_recipient(&first);
+    s.client.propose_recipient(&second);
+
+    assert_eq!(s.client.pending_recipient(), Some(second.clone()));
+    s.client.accept_recipient();
+    assert_eq!(s.client.recipient(), second);
+}
+
+#[test]
+fn recipient_ceremony_requires_both_signatures() {
+    let s = Setup::new(100, 3_600, false);
+    let new_recipient = Address::generate(&s.env);
+    let stranger = Address::generate(&s.env);
+
+    s.env.mock_auths(&[MockAuth {
+        address: &stranger,
+        invoke: &MockAuthInvoke {
+            contract: &s.client.address,
+            fn_name: "propose_recipient",
+            args: (&new_recipient,).into_val(&s.env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(s.client.try_propose_recipient(&new_recipient).is_err());
+    assert_eq!(s.client.pending_recipient(), None);
+
+    s.env.mock_auths(&[MockAuth {
+        address: &s.recipient,
+        invoke: &MockAuthInvoke {
+            contract: &s.client.address,
+            fn_name: "propose_recipient",
+            args: (&new_recipient,).into_val(&s.env),
+            sub_invokes: &[],
+        },
+    }]);
+    s.client.propose_recipient(&new_recipient);
+
+    s.env.mock_auths(&[MockAuth {
+        address: &s.recipient,
+        invoke: &MockAuthInvoke {
+            contract: &s.client.address,
+            fn_name: "accept_recipient",
+            args: ().into_val(&s.env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(s.client.try_accept_recipient().is_err());
+    assert_eq!(s.client.recipient(), s.recipient);
+
+    s.env.mock_auths(&[MockAuth {
+        address: &new_recipient,
+        invoke: &MockAuthInvoke {
+            contract: &s.client.address,
+            fn_name: "accept_recipient",
+            args: ().into_val(&s.env),
+            sub_invokes: &[],
+        },
+    }]);
+    s.client.accept_recipient();
+    assert_eq!(s.client.recipient(), new_recipient);
+}
+
+#[test]
+fn accept_recipient_without_proposal_is_rejected() {
+    let s = Setup::new(100, 3_600, false);
+    assert_eq!(
+        s.client.try_accept_recipient(),
+        Err(Ok(Error::NoRecipientProposal))
+    );
+    assert_eq!(s.client.try_withdraw(&1), Err(Ok(Error::NothingToWithdraw)));
+}
+
+#[test]
+fn recipient_proposal_rejects_invalid_addresses_and_terminal_streams() {
+    let s = Setup::new(100, 100, false);
+    let zero = Address::from_string(&soroban_sdk::String::from_str(
+        &s.env,
+        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+    ));
+    let new_recipient = Address::generate(&s.env);
+
+    assert_eq!(
+        s.client.try_propose_recipient(&zero),
+        Err(Ok(Error::InvalidRecipient))
+    );
+    assert_eq!(
+        s.client.try_propose_recipient(&s.recipient),
+        Err(Ok(Error::InvalidRecipient))
+    );
+    assert_eq!(s.client.recipient_proposal(), None);
+
+    s.advance_secs(200);
+    assert_eq!(
+        s.client.try_propose_recipient(&new_recipient),
+        Err(Ok(Error::StreamEnded))
+    );
+
+    let cancelled = Setup::new(100, 3_600, false);
+    cancelled.client.cancel(&cancelled.sender);
+    assert_eq!(
+        cancelled
+            .client
+            .try_propose_recipient(&Address::generate(&cancelled.env)),
+        Err(Ok(Error::StreamCancelled))
+    );
+}
+
+#[test]
+fn recipient_change_clears_pending_proposal() {
+    let s = Setup::new(100, 3_600, false);
+    let proposed = Address::generate(&s.env);
+    let transferred = Address::generate(&s.env);
+
+    s.client.propose_recipient(&proposed);
+    s.client.transfer_recipient(&transferred);
+
+    assert_eq!(s.client.recipient(), transferred);
+    assert_eq!(s.client.recipient_proposal(), None);
+    assert_eq!(
+        s.client.try_accept_recipient(),
+        Err(Ok(Error::NoRecipientProposal))
+    );
+}
+
+#[test]
+fn accept_recipient_rejects_a_stale_proposal() {
+    let s = Setup::new(100, 3_600, false);
+    let new_recipient = Address::generate(&s.env);
+    let previous_recipient = Address::generate(&s.env);
+    s.env.as_contract(&s.client.address, || {
+        s.env.storage().instance().set(
+            &DataKey::RecipientProposal,
+            &RecipientProposal {
+                current_recipient: previous_recipient,
+                new_recipient: new_recipient.clone(),
+                proposed_at: s.env.ledger().timestamp(),
+            },
+        );
+    });
+
+    assert_eq!(
+        s.client.try_accept_recipient(),
+        Err(Ok(Error::RecipientProposalStale))
+    );
+    assert_eq!(s.client.recipient(), s.recipient);
+}
+
+#[test]
+fn accepted_recipient_clears_recipient_scoped_configuration() {
+    let s = Setup::new(100, 3_600, false);
+    let new_recipient = Address::generate(&s.env);
+    let forward = Address::generate(&s.env);
+    let delegate = Address::generate(&s.env);
+    let recovery = Address::generate(&s.env);
+
+    s.client.set_auto_forward_address(&forward);
+    s.client.set_claim_delegate(&delegate);
+    s.client.set_recovery_address(&recovery, &300);
+    s.client.propose_recipient(&new_recipient);
+    s.client.accept_recipient();
+
+    assert_eq!(s.client.auto_forward_address(), None);
+    assert_eq!(s.client.claim_delegate(), None);
+    assert_eq!(s.client.recovery_address(), None);
+    assert_eq!(s.client.recovery_claimable_at(), None);
+}
+
+#[test]
+fn recipient_ceremony_emits_proposal_and_transfer_events() {
+    let s = Setup::new(100, 3_600, false);
+    let new_recipient = Address::generate(&s.env);
+
+    s.client.propose_recipient(&new_recipient);
+    let all_events = s.env.events().all();
+    let proposed_topics = (
+        Symbol::new(&s.env, "StreamRecipientTransferProposed"),
+        s.recipient.clone(),
+        2_u64,
+    )
+        .into_val(&s.env);
+    let proposed = all_events
+        .iter()
+        .find(|(contract, topics, _)| contract == &s.client.address && topics == &proposed_topics)
+        .expect("proposal event must be emitted");
+    let proposed_data: (Address, Address) = proposed.2.try_into_val(&s.env).unwrap();
+    assert_eq!(proposed_data, (s.recipient.clone(), new_recipient.clone()));
+
+    s.client.accept_recipient();
+    let all_events = s.env.events().all();
+    let transferred_topics = (
+        Symbol::new(&s.env, "StreamRecipientTransferred"),
+        s.recipient.clone(),
+        3_u64,
+    )
+        .into_val(&s.env);
+    let transferred = all_events
+        .iter()
+        .find(|(contract, topics, _)| {
+            contract == &s.client.address && topics == &transferred_topics
+        })
+        .expect("transfer event must be emitted");
+    let transferred_data: (Address, Address) = transferred.2.try_into_val(&s.env).unwrap();
+    assert_eq!(transferred_data, (s.recipient.clone(), new_recipient));
 }
 
 // ── Pause / Resume ────────────────────────────────────────────────────────────
@@ -3114,9 +3355,9 @@ fn recipient_transfer_emits_event_with_old_and_new_recipients() {
 #[test]
 fn elapsed_seconds_calculates_stream_age_correctly() {
     let s = Setup::new(10, 1_000, false);
-    let info = s.env.as_contract(&s.client.address, || {
-        crate::state::load(&s.env)
-    });
+    let info = s
+        .env
+        .as_contract(&s.client.address, || crate::state::load(&s.env));
 
     // Before start
     assert_eq!(info.elapsed_seconds(info.start_time.saturating_sub(10)), 0);
@@ -3547,7 +3788,8 @@ fn top_up_by_funder_rejects_zero_amount() {
 fn has_event_named(env: &Env, name: &str) -> bool {
     let want = soroban_sdk::Symbol::new(env, name);
     for (_addr, topics, _data) in env.events().all().iter() {
-        let first: Option<soroban_sdk::Symbol> = topics.get(0).and_then(|v| v.try_into_val(env).ok());
+        let first: Option<soroban_sdk::Symbol> =
+            topics.get(0).and_then(|v| v.try_into_val(env).ok());
         if first == Some(want.clone()) {
             return true;
         }
@@ -3569,7 +3811,6 @@ fn resume_emits_stream_resumed_event() {
     s.client.resume(&s.sender);
     assert!(has_event_named(&s.env, "StreamResumed"));
 }
-
 
 #[test]
 fn rejected_double_pause_emits_no_stream_paused_event() {
@@ -3733,10 +3974,7 @@ fn cancel_delegate_allows_cancellation_within_window_only() {
     assert!(!s.client.can_cancel_as_delegate(&stranger));
 
     // Cancel delegate CANNOT invoke other privileged sender actions (e.g. pause)
-    assert_eq!(
-        s.client.try_pause(&delegate),
-        Err(Ok(Error::NotAuthorized))
-    );
+    assert_eq!(s.client.try_pause(&delegate), Err(Ok(Error::NotAuthorized)));
 
     // Delegate CAN cancel while within window
     s.client.cancel(&delegate);
@@ -3976,6 +4214,7 @@ fn recipient_cannot_be_its_own_claim_delegate() {
         s.client.try_set_claim_delegate(&s.recipient),
         Err(Ok(Error::InvalidRecipient))
     );
+}
 
 // ---------------------------------------------------------------------------
 // Compact StreamFlags bitfield (#882)
@@ -4025,7 +4264,9 @@ fn stream_flags_bitfield_getters_setters_and_persistent_roundtrip() {
 
 #[test]
 fn vesting_curve_linear_exponential_decay_and_stepped_invariants() {
-    use crate::state::{get_vesting_curve, set_vesting_curve, vested_amount_for_curve, VestingCurve};
+    use crate::state::{
+        get_vesting_curve, set_vesting_curve, vested_amount_for_curve, VestingCurve,
+    };
 
     let total: i128 = 1_000_000;
     let duration: u64 = 1_000;
@@ -4044,11 +4285,26 @@ fn vesting_curve_linear_exponential_decay_and_stepped_invariants() {
 
     // Stepped vesting unlocks in discrete 250-second chunks.
     let stepped = VestingCurve::Stepped(250);
-    assert_eq!(vested_amount_for_curve(&stepped, total, 249, duration).unwrap(), 0);
-    assert_eq!(vested_amount_for_curve(&stepped, total, 250, duration).unwrap(), 250_000);
-    assert_eq!(vested_amount_for_curve(&stepped, total, 749, duration).unwrap(), 500_000);
-    assert_eq!(vested_amount_for_curve(&stepped, total, 750, duration).unwrap(), 750_000);
-    assert_eq!(vested_amount_for_curve(&stepped, total, duration, duration).unwrap(), total);
+    assert_eq!(
+        vested_amount_for_curve(&stepped, total, 249, duration).unwrap(),
+        0
+    );
+    assert_eq!(
+        vested_amount_for_curve(&stepped, total, 250, duration).unwrap(),
+        250_000
+    );
+    assert_eq!(
+        vested_amount_for_curve(&stepped, total, 749, duration).unwrap(),
+        500_000
+    );
+    assert_eq!(
+        vested_amount_for_curve(&stepped, total, 750, duration).unwrap(),
+        750_000
+    );
+    assert_eq!(
+        vested_amount_for_curve(&stepped, total, duration, duration).unwrap(),
+        total
+    );
 
     // Storage roundtrip defaults to Linear and persists configured curve.
     let s = Setup::new(100, 3600, false);
@@ -4070,13 +4326,15 @@ fn set_cliff_returns_invalid_cliff_duration_outside_stream_bounds() {
 
     // Cliff before start_time -> InvalidCliffDuration
     assert_eq!(
-        s.client.try_set_cliff(&s.sender, &(info.start_time - 1), &100),
+        s.client
+            .try_set_cliff(&s.sender, &(info.start_time - 1), &100),
         Err(Ok(Error::InvalidCliffDuration))
     );
 
     // Cliff after end_time -> InvalidCliffDuration
     assert_eq!(
-        s.client.try_set_cliff(&s.sender, &(info.end_time + 1), &100),
+        s.client
+            .try_set_cliff(&s.sender, &(info.end_time + 1), &100),
         Err(Ok(Error::InvalidCliffDuration))
     );
 
@@ -4108,7 +4366,11 @@ fn fuzz_extreme_stream_durations_and_arbitrary_tuples() {
     let boundary_cases: &[(u64, u64, i128)] = &[
         (0, ONE_SECOND, 1),
         (1_000, 1_000 + ONE_SECOND, 1_000_000_000_000),
-        (1_700_000_000, 1_700_000_000 + HUNDRED_YEARS, 10_000_000_000_000_000_000),
+        (
+            1_700_000_000,
+            1_700_000_000 + HUNDRED_YEARS,
+            10_000_000_000_000_000_000,
+        ),
         (u64::MAX - 10, u64::MAX, 500_000_000),
         (u64::MAX - HUNDRED_YEARS, u64::MAX, i128::MAX / 4),
     ];
@@ -4184,7 +4446,10 @@ fn fuzz_extreme_stream_durations_and_arbitrary_tuples() {
             let v2 = vested_amount_for_curve(curve, deposit, t2, effective_duration).unwrap();
             assert!(v1 >= 0 && v1 <= deposit, "v1 out of bounds");
             assert!(v2 >= 0 && v2 <= deposit, "v2 out of bounds");
-            assert!(v1 <= v2, "monotonicity violated for {curve:?}: v({t1})={v1} > v({t2})={v2}");
+            assert!(
+                v1 <= v2,
+                "monotonicity violated for {curve:?}: v({t1})={v1} > v({t2})={v2}"
+            );
         }
     }
 }
