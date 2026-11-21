@@ -1990,3 +1990,17 @@ fn sweep_to_strategy_validates_amount_liquidity_and_pause() {
     assert_eq!(s.token.balance(&strategy), 0);
     assert_eq!(s.client.strategy_swept(&s.token.address, &strategy), 0);
 }
+
+// ── Issue #949: per-token vault balance query ───────────────────────────────
+
+#[test]
+fn token_vault_balance_reports_holdings_per_token() {
+    let s = Setup::new(1_000_000);
+    assert_eq!(s.client.token_vault_balance(&s.token.address), 0);
+    s.client.deposit(&s.owner, &100);
+    assert_eq!(s.client.token_vault_balance(&s.token.address), 100);
+    assert_eq!(
+        s.client.token_vault_balance(&s.token.address),
+        s.token.balance(&s.client.address)
+    );
+}

@@ -1149,6 +1149,11 @@ impl TokenVault {
         get_token_account_balance(&env, &token, &account)
     }
 
+    /// Read-only: total balance of `token` currently held by this vault (Issue #949).
+    pub fn token_vault_balance(env: Env, token: Address) -> i128 {
+        token::Client::new(&env, &token).balance(&env.current_contract_address())
+    }
+
     /// Sets the maximum deposit limit for a specific token (Issue #724).
     pub fn set_token_max_limit(
         env: Env,
