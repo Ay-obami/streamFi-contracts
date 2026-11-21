@@ -1062,6 +1062,7 @@ impl TokenVault {
                 amount,
                 tk.balance(&env.current_contract_address()),
             );
+            events::vault_deposit(&env, &from, &token, amount);
             Ok(())
         })
     }
@@ -1122,7 +1123,15 @@ impl TokenVault {
             record_vault_balance(&env, &token, new_vault_bal);
             let by_operator = caller != owner;
             events::withdrawn(&env, &caller, &to, amount, new_vault_bal, by_operator);
-            events::vault_withdrawal(&env, &caller, &to, amount, vault_bal, new_vault_bal);
+            events::vault_withdrawal(
+                &env,
+                &caller,
+                &token,
+                &to,
+                amount,
+                vault_bal,
+                new_vault_bal,
+            );
 
             bump_instance(&env);
             Ok(())

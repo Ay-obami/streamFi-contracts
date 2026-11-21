@@ -1762,10 +1762,38 @@ fn test_vault_withdrawal_event_includes_previous_and_new_balance() {
     assert_eq!(
         payload,
         events::VaultWithdrawal {
+            token: s.token.address.clone(),
             recipient: recipient.clone(),
             amount: 400,
             previous_balance: 1_000,
             new_balance: 600,
+            timestamp: s.env.ledger().timestamp(),
+        }
+    );
+}
+
+// ── Issue #950: VaultDeposit event with token and ledger timestamp ──────────
+
+#[test]
+fn deposit_token_emits_vault_deposit_event() {
+    let s = Setup::new(1_000_000);
+    s.client.deposit_token(&s.owner, &s.token.address, &250);
+
+    let events = s.env.events().all();
+    let (_, topics, data) = events.last().unwrap();
+    assert_eq!(
+        topics.clone(),
+        (Symbol::new(&s.env, "VaultDeposit"), s.owner.clone()).into_val(&s.env)
+    );
+
+    let payload: events::VaultDeposit = data.clone().try_into_val(&s.env).unwrap();
+    assert_eq!(
+        payload,
+        events::VaultDeposit {
+            token: s.token.address.clone(),
+            from: s.owner.clone(),
+            amount: 250,
+            timestamp: s.env.ledger().timestamp(),
         }
     );
 }
