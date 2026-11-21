@@ -2019,6 +2019,36 @@ fn sweep_to_strategy_validates_amount_liquidity_and_pause() {
     assert_eq!(s.client.strategy_swept(&s.token.address, &strategy), 0);
 }
 
+// ── Issue #952: persistent entries are removed at zero balance ──────────────
+
+#[test]
+fn zero_balance_removes_persistent_balance_entries() {
+    let s = Setup::new(1_000_000);
+    s.client.deposit(&s.owner, &100);
+    let recipient = Address::generate(&s.env);
+    s.client
+        .withdraw_token(&s.owner, &s.token.address, &recipient, &100);
+
+    assert_eq!(
+        s.client.get_token_account_balance(&s.token.address, &s.owner),
+        0
+    );
+    assert_eq!(
+        s.client.get_depositor_token_balance(&s.owner, &s.token.address),
+        0
+    );
+    let contract = s.client.address.clone();
+    s.env.as_contract(&contract, || {
+        let acc_key =
+            storage::DataKey::TokenAccountBalance(s.token.address.clone(), s.owner.clone());
+        let dep_key = storage::DataKey::DepositorTokens(s.owner.clone(), s.token.address.clone());
+        assert!(!s.env.storage().persistent().has(&acc_key));
+        assert!(!s.env.storage().persistent().has(&dep_key));
+    });
+    // Tracked keys that were removed are skipped rather than renewed.
+    assert_eq!(s.client.bump_all_vault_keys(), 0);
+}
+
 // ── Issue #949: per-token vault balance query ───────────────────────────────
 
 #[test]

@@ -214,6 +214,11 @@ pub fn get_token_account_balance(env: &Env, token: &Address, account: &Address) 
 
 pub fn set_token_account_balance(env: &Env, token: &Address, account: &Address, balance: i128) {
     let key = DataKey::TokenAccountBalance(token.clone(), account.clone());
+    if balance == 0 {
+        // Reclaim rent: reads of a missing entry already default to 0.
+        env.storage().persistent().remove(&key);
+        return;
+    }
     env.storage().persistent().set(&key, &balance);
     drip_common::ttl::bump_persistent(env, &key);
     track_vault_key(env, &key);
@@ -233,6 +238,11 @@ pub fn get_depositor_token_balance(env: &Env, depositor: &Address, token: &Addre
 /// Sets balance of a specific token deposited by a user (Issue #757).
 pub fn set_depositor_token_balance(env: &Env, depositor: &Address, token: &Address, balance: i128) {
     let key = DataKey::DepositorTokens(depositor.clone(), token.clone());
+    if balance == 0 {
+        // Reclaim rent: reads of a missing entry already default to 0.
+        env.storage().persistent().remove(&key);
+        return;
+    }
     env.storage().persistent().set(&key, &balance);
     drip_common::ttl::bump_persistent(env, &key);
 }
