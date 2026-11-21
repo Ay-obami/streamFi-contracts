@@ -70,21 +70,12 @@ pub const MAX_STREAM_BATCH_WITHDRAWALS: u32 = 10;
 #[macro_export]
 macro_rules! non_reentrant {
     ($env:expr, $body:block) => {{
-        if $env
-            .storage()
-            .temporary()
-            .get::<_, bool>(&$crate::storage::DataKey::ReentrancyLock)
-            .unwrap_or(false)
-        {
+        if $crate::storage::is_reentrancy_locked(&$env) {
             return Err($crate::errors::Error::ReentrancyDetected);
         }
-        $env.storage()
-            .temporary()
-            .set(&$crate::storage::DataKey::ReentrancyLock, &true);
+        $crate::storage::set_reentrancy_lock(&$env);
         let result = (|| -> Result<_, $crate::errors::Error> { $body })();
-        $env.storage()
-            .temporary()
-            .remove(&$crate::storage::DataKey::ReentrancyLock);
+        $crate::storage::remove_reentrancy_lock(&$env);
         result
     }};
 }
@@ -1058,6 +1049,7 @@ impl TokenVault {
                 amount,
                 tk.balance(&env.current_contract_address()),
             );
+            events::vault_deposit(&env, &from, &token, amount);
             Ok(())
         })
     }
@@ -1118,7 +1110,15 @@ impl TokenVault {
             record_vault_balance(&env, &token, new_vault_bal);
             let by_operator = caller != owner;
             events::withdrawn(&env, &caller, &to, amount, new_vault_bal, by_operator);
-            events::vault_withdrawal(&env, &caller, &to, amount, vault_bal, new_vault_bal);
+            events::vault_withdrawal(
+                &env,
+                &caller,
+                &token,
+                &to,
+                amount,
+                vault_bal,
+                new_vault_bal,
+            );
 
             bump_instance(&env);
             Ok(())
@@ -1143,6 +1143,11 @@ impl TokenVault {
     /// Read-only: alias for get_token_account_balance (Issue #724).
     pub fn balance_by_token(env: Env, token: Address, account: Address) -> i128 {
         get_token_account_balance(&env, &token, &account)
+    }
+
+    /// Read-only: total balance of `token` currently held by this vault (Issue #949).
+    pub fn token_vault_balance(env: Env, token: Address) -> i128 {
+        token::Client::new(&env, &token).balance(&env.current_contract_address())
     }
 
     /// Sets the maximum deposit limit for a specific token (Issue #724).

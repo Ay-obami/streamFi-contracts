@@ -1762,10 +1762,38 @@ fn test_vault_withdrawal_event_includes_previous_and_new_balance() {
     assert_eq!(
         payload,
         events::VaultWithdrawal {
+            token: s.token.address.clone(),
             recipient: recipient.clone(),
             amount: 400,
             previous_balance: 1_000,
             new_balance: 600,
+            timestamp: s.env.ledger().timestamp(),
+        }
+    );
+}
+
+// ── Issue #950: VaultDeposit event with token and ledger timestamp ──────────
+
+#[test]
+fn deposit_token_emits_vault_deposit_event() {
+    let s = Setup::new(1_000_000);
+    s.client.deposit_token(&s.owner, &s.token.address, &250);
+
+    let events = s.env.events().all();
+    let (_, topics, data) = events.last().unwrap();
+    assert_eq!(
+        topics.clone(),
+        (Symbol::new(&s.env, "VaultDeposit"), s.owner.clone()).into_val(&s.env)
+    );
+
+    let payload: events::VaultDeposit = data.clone().try_into_val(&s.env).unwrap();
+    assert_eq!(
+        payload,
+        events::VaultDeposit {
+            token: s.token.address.clone(),
+            from: s.owner.clone(),
+            amount: 250,
+            timestamp: s.env.ledger().timestamp(),
         }
     );
 }
@@ -1989,4 +2017,48 @@ fn sweep_to_strategy_validates_amount_liquidity_and_pause() {
     );
     assert_eq!(s.token.balance(&strategy), 0);
     assert_eq!(s.client.strategy_swept(&s.token.address, &strategy), 0);
+}
+
+// ── Issue #952: persistent entries are removed at zero balance ──────────────
+
+#[test]
+fn zero_balance_removes_persistent_balance_entries() {
+    let s = Setup::new(1_000_000);
+    s.client.deposit(&s.owner, &100);
+    let recipient = Address::generate(&s.env);
+    s.client
+        .withdraw_token(&s.owner, &s.token.address, &recipient, &100);
+
+    assert_eq!(
+        s.client.get_token_account_balance(&s.token.address, &s.owner),
+        0
+    );
+    assert_eq!(
+        s.client.get_depositor_token_balance(&s.owner, &s.token.address),
+        0
+    );
+    let contract = s.client.address.clone();
+    s.env.as_contract(&contract, || {
+        let acc_key =
+            storage::DataKey::TokenAccountBalance(s.token.address.clone(), s.owner.clone());
+        let dep_key = storage::DataKey::DepositorTokens(s.owner.clone(), s.token.address.clone());
+        assert!(!s.env.storage().persistent().has(&acc_key));
+        assert!(!s.env.storage().persistent().has(&dep_key));
+    });
+    // Tracked keys that were removed are skipped rather than renewed.
+    assert_eq!(s.client.bump_all_vault_keys(), 0);
+}
+
+// ── Issue #949: per-token vault balance query ───────────────────────────────
+
+#[test]
+fn token_vault_balance_reports_holdings_per_token() {
+    let s = Setup::new(1_000_000);
+    assert_eq!(s.client.token_vault_balance(&s.token.address), 0);
+    s.client.deposit(&s.owner, &100);
+    assert_eq!(s.client.token_vault_balance(&s.token.address), 100);
+    assert_eq!(
+        s.client.token_vault_balance(&s.token.address),
+        s.token.balance(&s.client.address)
+    );
 }
