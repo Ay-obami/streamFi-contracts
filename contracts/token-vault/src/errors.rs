@@ -59,4 +59,10 @@ pub enum Error {
     DepositBelowMin = 28,
     /// `sweep_to_strategy` targeted a strategy vault governance has not approved (Issue #893).
     StrategyNotApproved = 29,
+    /// The vault balance cannot cover this withdrawal (#954). Distinct from a liquidity
+    /// shortfall at the token contract, which is `InsufficientVaultLiquidity`.
+    InsufficientVaultBalance = 210,
+    /// The caller is not an authorized vault operator (#954). Distinct from `NotAuthorized`,
+    /// which covers owner-only calls.
+    UnauthorizedOperator = 211,
 }

@@ -85,6 +85,9 @@ fn read_stream_count(env: &Env) -> u64 {
 #[contract]
 pub struct DripFactory;
 
+/// Most recent stream ids scanned by `get_streams_by_ledger_range` in one call (#956).
+const MAX_LEDGER_RANGE_SCAN: u32 = 500;
+
 #[contractimpl]
 impl DripFactory {
     /// One-time setup — called by the deploy script.
@@ -413,6 +416,15 @@ impl DripFactory {
         // they use persistent storage (not instance storage) to avoid hitting
         // instance storage size limits as the protocol scales.
         //
+        // Deployment ledger for `get_streams_by_ledger_range` (#956).
+        env.storage()
+            .persistent()
+            .set(&DataKey::StreamLedger(stream_id), &env.ledger().sequence());
+        env.storage().persistent().extend_ttl(
+            &DataKey::StreamLedger(stream_id),
+            ttl::THRESHOLD,
+            ttl::EXTEND_TO,
+        );
         // Persistent storage entry 1 — StreamAddr:
         //   Key:   DataKey::StreamAddr(stream_id)
         //          XDR serialization: [discriminant: u32][stream_id: u64]
@@ -1059,6 +1071,47 @@ impl DripFactory {
     /// As a maintenance operation, this also drives the bounded TTL walker
     /// so the persistent-by-ID registry stays alive during protocol-upgrade
     /// activity even if no `create_stream` calls happen between upgrades.
+    /// #956: stream contracts deployed at a ledger in `start_ledger..=end_ledger`, in stream-id order.
+    ///
+    /// Scans only the most recent `MAX_LEDGER_RANGE_SCAN` stream ids, so each call costs a bounded
+    /// number of reads. Older streams are outside the scanned window and are not returned, and
+    /// streams deployed before ledger tracking have no record and are never returned.
+    pub fn get_streams_by_ledger_range(
+        env: Env,
+        start_ledger: u32,
+        end_ledger: u32,
+    ) -> Result<Vec<Address>, Error> {
+        if start_ledger > end_ledger {
+            return Err(Error::InvalidTimeRange);
+        }
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::StreamCount)
+            .unwrap_or(0);
+        let scan_from = count
+            .saturating_sub(MAX_LEDGER_RANGE_SCAN as u64)
+            .saturating_add(1);
+        let mut out: Vec<Address> = Vec::new(&env);
+        let mut id = scan_from;
+        while id <= count {
+            let deployed: Option<u32> = env.storage().persistent().get(&DataKey::StreamLedger(id));
+            if let Some(ledger) = deployed {
+                if ledger >= start_ledger && ledger <= end_ledger {
+                    if let Some(addr) = env
+                        .storage()
+                        .persistent()
+                        .get::<_, Address>(&DataKey::StreamAddr(id))
+                    {
+                        out.push_back(addr);
+                    }
+                }
+            }
+            id += 1;
+        }
+        Ok(out)
+    }
+
     pub fn upgrade_stream_wasm(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
         deploy::set_stream_wasm_hash(&env, &new_wasm_hash)
     }

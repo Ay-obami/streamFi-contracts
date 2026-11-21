@@ -349,4 +349,10 @@ pub enum DataKey {
     /// Value: `Vec<WasmVersionInfo>` — oldest first. The last entry always matches
     /// `DataKey::StreamWasmHash`.
     WasmVersionHistory,
+
+    /// **Persistent storage.** Ledger sequence at which stream `id` was deployed (#956).
+    /// Key: `DataKey::StreamLedger(u64)` — the stream's unique ID
+    /// Value: `u32` — the ledger sequence at creation
+    /// Absent for streams deployed before this key was introduced.
+    StreamLedger(u64),
 }
