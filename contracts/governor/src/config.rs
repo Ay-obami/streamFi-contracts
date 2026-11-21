@@ -9,6 +9,10 @@ use crate::Error;
 /// Prevents flash-loan voting attacks and allows DAO participants time to react.
 pub const MIN_VOTING_PERIOD_LEDGERS: u32 = 17280;
 
+/// Maximum voting period: 241920 ledgers (~14 days on Soroban) (#969).
+/// Bounds how long a proposal can stay open, so governance cannot stall.
+pub const MAX_VOTING_PERIOD_LEDGERS: u32 = 241_920;
+
 /// Default timelock delay between proposal creation and execution: 48 hours (Issue #967).
 pub const DEFAULT_TIMELOCK_DELAY_SECS: u64 = 172_800;
 
@@ -73,10 +77,11 @@ pub fn load(env: &Env) -> Result<GovernorConfig, Error> {
     })
 }
 
-/// Validate and set the minimum voting period (Issue #772).
-/// Ensures voting period is at least MIN_VOTING_PERIOD_LEDGERS to prevent attacks.
+/// Validate and set the voting period (#772, #969).
+/// The period must lie within MIN_VOTING_PERIOD_LEDGERS..=MAX_VOTING_PERIOD_LEDGERS
+/// (about 1 to 14 days).
 pub fn set_voting_period(env: &Env, voting_period_ledgers: u32) -> Result<(), Error> {
-    if voting_period_ledgers < MIN_VOTING_PERIOD_LEDGERS {
+    if !(MIN_VOTING_PERIOD_LEDGERS..=MAX_VOTING_PERIOD_LEDGERS).contains(&voting_period_ledgers) {
         return Err(Error::InvalidParam);
     }
     env.storage()

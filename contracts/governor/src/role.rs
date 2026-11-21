@@ -198,6 +198,45 @@ pub fn set_emergency_multisig_threshold(env: &Env, threshold: u32) -> Result<(),
     Ok(())
 }
 
+/// Require M-of-N approval for a critical parameter update (#970).
+///
+/// Succeeds only when at least `threshold` distinct accounts in `approvers`
+/// hold `Role::Admin` and have authorized this invocation. Duplicate entries
+/// count once, and non-admins are ignored. Fails with `InvalidParam` when
+/// `threshold` is zero or larger than the number of approvers, and with
+/// `NotAuthorized` when too few valid approvals are present.
+///
+/// This is the verification helper. Callers that need multi-sig must pass the
+/// approver list and threshold themselves.
+pub fn require_admin_threshold(
+    env: &Env,
+    approvers: &Vec<Address>,
+    threshold: u32,
+) -> Result<(), Error> {
+    if threshold == 0 || approvers.len() < threshold {
+        return Err(Error::InvalidParam);
+    }
+    let mut counted: Vec<Address> = Vec::new(env);
+    for approver in approvers.iter() {
+        let mut already = false;
+        for seen in counted.iter() {
+            if seen == approver {
+                already = true;
+                break;
+            }
+        }
+        if already || !has_role(env, Role::Admin, &approver) {
+            continue;
+        }
+        approver.require_auth();
+        counted.push_back(approver);
+        if counted.len() >= threshold {
+            return Ok(());
+        }
+    }
+    Err(Error::NotAuthorized)
+}
+
 /// Propose transferring the admin role to a new address (step 1 of 2) (Issue #682).
 pub fn propose_admin(env: &Env, proposer: &Address, new_admin: &Address) -> Result<(), Error> {
     require_role(env, proposer, Role::Admin)?;
