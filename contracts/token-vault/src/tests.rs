@@ -571,7 +571,7 @@ fn pause_blocks_deposit() {
     let s = Setup::new(1_000_000);
     s.client.pause(&s.owner);
     let result = s.client.try_deposit(&s.user, &100);
-    assert_eq!(result, Err(Ok(Error::ContractPaused)));
+    assert_eq!(result, Err(Ok(Error::VaultPaused)));
 }
 
 #[test]
@@ -582,7 +582,7 @@ fn pause_blocks_withdraw() {
 
     let recipient = Address::generate(&s.env);
     let result = s.client.try_withdraw(&s.owner, &recipient, &100);
-    assert_eq!(result, Err(Ok(Error::ContractPaused)));
+    assert_eq!(result, Err(Ok(Error::VaultPaused)));
 }
 
 #[test]
@@ -590,7 +590,7 @@ fn pause_blocks_set_limit() {
     let s = Setup::new(1_000_000);
     s.client.pause(&s.owner);
     let result = s.client.try_set_limit(&s.owner, &2_000_000);
-    assert_eq!(result, Err(Ok(Error::ContractPaused)));
+    assert_eq!(result, Err(Ok(Error::VaultPaused)));
 }
 
 #[test]
@@ -618,7 +618,183 @@ fn operator_also_blocked_by_pause() {
 
     let recipient = Address::generate(&s.env);
     let result = s.client.try_withdraw(&op, &recipient, &100);
-    assert_eq!(result, Err(Ok(Error::ContractPaused)));
+    assert_eq!(result, Err(Ok(Error::VaultPaused)));
+}
+
+#[test]
+fn vault_paused_error_is_distinct_and_gates_every_state_modifying_entrypoint() {
+    assert_eq!(Error::VaultPaused as u32, 25);
+    assert_ne!(Error::VaultPaused, Error::InsufficientVaultBalance);
+    assert_ne!(Error::VaultPaused, Error::InsufficientVaultLiquidity);
+
+    let s = Setup::new(1_000_000);
+    s.client.deposit(&s.owner, &1_000);
+    s.client.pause(&s.owner);
+
+    let token = s.token.address.clone();
+    let recipient = Address::generate(&s.env);
+    let strategy = Address::generate(&s.env);
+    let wasm_hash = soroban_sdk::BytesN::from_array(&s.env, &[1u8; 32]);
+    let deposits = soroban_sdk::vec![
+        &s.env,
+        DepositSpec {
+            from: s.owner.clone(),
+            amount: 100,
+        }
+    ];
+    let partial_deposits = soroban_sdk::vec![
+        &s.env,
+        crate::DepositArgs {
+            from: s.owner.clone(),
+            amount: 100,
+        }
+    ];
+    let payouts = soroban_sdk::vec![&s.env, (recipient.clone(), 100)];
+    let streams = soroban_sdk::vec![&s.env, Address::generate(&s.env)];
+
+    assert_eq!(
+        s.client.try_deposit(&s.owner, &100),
+        Err(Ok(Error::VaultPaused))
+    );
+    assert_eq!(
+        s.client.try_deposit_with_fee(&s.owner, &100, &10),
+        Err(Ok(Error::VaultPaused))
+    );
+    assert_eq!(
+        s.client.try_batch_deposit(&deposits),
+        Err(Ok(Error::VaultPaused))
+    );
+    assert_eq!(
+        s.client.try_batch_deposit_partial(&partial_deposits),
+        Err(Ok(Error::VaultPaused))
+    );
+    assert_eq!(
+        s.client.try_withdraw(&s.owner, &recipient, &100),
+        Err(Ok(Error::VaultPaused))
+    );
+    assert_eq!(
+        s.client.try_withdraw_batch(&s.owner, &payouts),
+        Err(Ok(Error::VaultPaused))
+    );
+    assert_eq!(
+        s.client.try_vault_batch_withdraw(&streams, &s.owner),
+        Err(Ok(Error::VaultPaused))
+    );
+    assert_eq!(
+        s.client.try_deposit_token(&s.owner, &token, &100),
+        Err(Ok(Error::VaultPaused))
+    );
+    assert_eq!(
+        s.client
+            .try_withdraw_token(&s.owner, &token, &recipient, &100),
+        Err(Ok(Error::VaultPaused))
+    );
+    assert_eq!(
+        s.client.try_deposit_with_failure_report(&s.owner, &100),
+        Err(Ok(Error::VaultPaused))
+    );
+    assert_eq!(
+        s.client.try_set_limit(&s.owner, &2_000_000),
+        Err(Ok(Error::VaultPaused))
+    );
+    assert_eq!(
+        s.client.try_set_operator_withdraw_limit(&s.owner, &100),
+        Err(Ok(Error::VaultPaused))
+    );
+    assert_eq!(
+        s.client.try_set_operator(&s.owner, &recipient),
+        Err(Ok(Error::VaultPaused))
+    );
+    assert_eq!(
+        s.client.try_revoke_operator(&s.owner),
+        Err(Ok(Error::VaultPaused))
+    );
+    assert_eq!(
+        s.client.try_propose_owner(&s.owner, &recipient),
+        Err(Ok(Error::VaultPaused))
+    );
+    assert_eq!(
+        s.client.try_accept_owner(&recipient),
+        Err(Ok(Error::VaultPaused))
+    );
+    assert_eq!(
+        s.client.try_set_owner_proposal_ttl(&s.owner, &60),
+        Err(Ok(Error::VaultPaused))
+    );
+    assert_eq!(
+        s.client.try_upgrade(&s.owner, &wasm_hash),
+        Err(Ok(Error::VaultPaused))
+    );
+    assert_eq!(
+        s.client.try_set_token_max_limit(&s.owner, &token, &1_000),
+        Err(Ok(Error::VaultPaused))
+    );
+    assert_eq!(
+        s.client.try_set_min_deposit_amount(&s.owner, &token, &1),
+        Err(Ok(Error::VaultPaused))
+    );
+    assert_eq!(
+        s.client.try_set_token_min_deposit(&s.owner, &token, &1),
+        Err(Ok(Error::VaultPaused))
+    );
+    assert_eq!(
+        s.client.try_set_emergency_admin(&s.owner, &recipient),
+        Err(Ok(Error::VaultPaused))
+    );
+    assert_eq!(
+        s.client.try_emergency_sweep(&s.owner, &token, &recipient),
+        Err(Ok(Error::VaultPaused))
+    );
+    assert_eq!(
+        s.client.try_approve_token(&s.owner, &token, &true),
+        Err(Ok(Error::VaultPaused))
+    );
+    assert_eq!(
+        s.client
+            .try_initiate_emergency_migration(&s.owner, &recipient),
+        Err(Ok(Error::VaultPaused))
+    );
+    assert_eq!(
+        s.client.try_execute_emergency_migration(&s.owner),
+        Err(Ok(Error::VaultPaused))
+    );
+    assert_eq!(
+        s.client.try_cancel_emergency_migration(&s.owner),
+        Err(Ok(Error::VaultPaused))
+    );
+    assert_eq!(
+        s.client.try_approve_strategy(&s.owner, &strategy, &true),
+        Err(Ok(Error::VaultPaused))
+    );
+    assert_eq!(
+        s.client
+            .try_sweep_to_strategy(&s.owner, &token, &strategy, &100),
+        Err(Ok(Error::VaultPaused))
+    );
+
+    // Maintenance and recovery controls stay available while halted.
+    s.client.keep_alive();
+    s.client.bump_all_vault_keys();
+    s.client.unpause(&s.owner);
+    assert!(!s.client.is_paused());
+    s.client.deposit(&s.owner, &100);
+}
+
+#[test]
+fn pause_is_reported_before_insufficient_balance_errors() {
+    let s = Setup::new(1_000_000);
+    let strategy = Address::generate(&s.env);
+    s.client.pause(&s.owner);
+
+    assert_eq!(
+        s.client.try_withdraw(&s.owner, &s.user, &1),
+        Err(Ok(Error::VaultPaused))
+    );
+    assert_eq!(
+        s.client
+            .try_sweep_to_strategy(&s.owner, &s.token.address, &strategy, &1),
+        Err(Ok(Error::VaultPaused))
+    );
 }
 
 // ── Event emission (issue #311) ────────────────────────────────────────────
@@ -1377,7 +1553,7 @@ fn batch_deposit_while_paused_fails() {
 
     assert_eq!(
         s.client.try_batch_deposit(&deposits),
-        Err(Ok(Error::ContractPaused))
+        Err(Ok(Error::VaultPaused))
     );
 }
 
@@ -1972,7 +2148,7 @@ fn sweep_to_strategy_rejects_unapproved_targets_and_tokens() {
     assert_eq!(
         s.client
             .try_sweep_to_strategy(&s.owner, &other_token, &strategy, &1_000),
-        Err(Ok(Error::TokenNotApproved))
+        Err(Ok(Error::TokenNotApprovedForVault))
     );
 
     // Revocation blocks further sweeps.
@@ -2013,7 +2189,7 @@ fn sweep_to_strategy_validates_amount_liquidity_and_pause() {
     assert_eq!(
         s.client
             .try_sweep_to_strategy(&s.owner, &s.token.address, &strategy, &1_000),
-        Err(Ok(Error::ContractPaused))
+        Err(Ok(Error::VaultPaused))
     );
     assert_eq!(s.token.balance(&strategy), 0);
     assert_eq!(s.client.strategy_swept(&s.token.address, &strategy), 0);

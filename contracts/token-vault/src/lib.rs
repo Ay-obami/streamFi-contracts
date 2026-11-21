@@ -140,13 +140,14 @@ fn require_owner_or_operator(env: &Env, caller: &Address, owner: &Address) -> Re
     }
 }
 
-/// Short-circuit helper: reject any state-mutating call while paused.
+/// Short-circuit helper: reject any state-modifying call while paused.
 ///
 /// Delegates to the protocol-wide gate in [`drip_common::pause`], mapping the
-/// shared `PausedError` onto the vault's own `Error::ContractPaused` — the same
-/// gate `DripFactory`, `DripGovernor`, and `TwapOracle` run.
+/// shared `PausedError` onto the vault's own `Error::VaultPaused` — a distinct
+/// code so callers never mistake a halted vault for a balance shortfall
+/// (Issue #896).
 fn assert_not_paused(env: &Env) -> Result<(), Error> {
-    drip_common::pause::require_not_paused(env, &DataKey::Paused).map_err(|_| Error::ContractPaused)
+    drip_common::pause::require_not_paused(env, &DataKey::Paused).map_err(|_| Error::VaultPaused)
 }
 
 fn withdraw_payouts(
@@ -154,8 +155,8 @@ fn withdraw_payouts(
     caller: &Address,
     payouts: &Vec<(Address, i128)>,
 ) -> Result<(), Error> {
+    assert_not_paused(env)?;
     non_reentrant!(env, {
-        assert_not_paused(env)?;
         let owner = get_owner(env).ok_or(Error::NotInitialized)?;
         require_owner_or_operator(env, caller, &owner)?;
 
@@ -239,6 +240,7 @@ impl TokenVault {
         token: Address,
         max_limit: i128,
     ) -> Result<(), Error> {
+        assert_not_paused(&env)?;
         owner.require_auth();
 
         if max_limit <= 0 {
@@ -263,8 +265,8 @@ impl TokenVault {
     }
 
     pub fn deposit(env: Env, from: Address, amount: i128) -> Result<(), Error> {
+        assert_not_paused(&env)?;
         non_reentrant!(&env, {
-            assert_not_paused(&env)?;
             let owner = get_owner(&env).ok_or(Error::NotInitialized)?;
             require_owner_or_operator(&env, &from, &owner)?;
 
@@ -335,6 +337,7 @@ impl TokenVault {
         gross_amount: i128,
         fee_amount: i128,
     ) -> Result<(), Error> {
+        assert_not_paused(&env)?;
         if fee_amount < 0 || gross_amount <= 0 || fee_amount >= gross_amount {
             return Err(Error::InvalidAmount);
         }
@@ -354,8 +357,8 @@ impl TokenVault {
     ///
     /// Requires authorization from each depositor individually.
     pub fn batch_deposit(env: Env, deposits: Vec<DepositSpec>) -> Result<(), Error> {
+        assert_not_paused(&env)?;
         non_reentrant!(&env, {
-            assert_not_paused(&env)?;
             if deposits.is_empty() {
                 return Err(Error::InvalidAmount);
             }
@@ -452,8 +455,8 @@ impl TokenVault {
         env: Env,
         deposits: Vec<DepositArgs>,
     ) -> Result<Vec<BatchDepositResult>, Error> {
+        assert_not_paused(&env)?;
         non_reentrant!(&env, {
-            assert_not_paused(&env)?;
             if deposits.is_empty() {
                 return Err(Error::InvalidAmount);
             }
@@ -711,6 +714,7 @@ impl TokenVault {
     /// owner can delegate day-to-day operations to a hot wallet while keeping
     /// the owner key in cold storage.
     pub fn set_operator(env: Env, caller: Address, operator: Address) -> Result<(), Error> {
+        assert_not_paused(&env)?;
         let owner = get_owner(&env).ok_or(Error::NotInitialized)?;
         if caller != owner {
             return Err(Error::NotAuthorized);
@@ -726,6 +730,7 @@ impl TokenVault {
     ///
     /// No-op (not an error) if no operator is currently set.
     pub fn revoke_operator(env: Env, caller: Address) -> Result<(), Error> {
+        assert_not_paused(&env)?;
         let owner = get_owner(&env).ok_or(Error::NotInitialized)?;
         if caller != owner {
             return Err(Error::NotAuthorized);
@@ -753,6 +758,7 @@ impl TokenVault {
     /// - `NotAuthorized` — `caller` is not the current owner.
     /// - `InvalidParam` — `new_owner` is the zero address.
     pub fn propose_owner(env: Env, caller: Address, new_owner: Address) -> Result<(), Error> {
+        assert_not_paused(&env)?;
         let owner = get_owner(&env).ok_or(Error::NotInitialized)?;
         if caller != owner {
             return Err(Error::NotAuthorized);
@@ -780,6 +786,7 @@ impl TokenVault {
     /// - `NoPendingOwner` — no owner transfer has been proposed.
     /// - `NotPendingOwner` — `caller` is not the proposed pending owner.
     pub fn accept_owner(env: Env, caller: Address) -> Result<(), Error> {
+        assert_not_paused(&env)?;
         let pending = get_pending_owner(&env).ok_or(Error::NoPendingOwner)?;
         if caller != pending {
             return Err(Error::NotPendingOwner);
@@ -866,6 +873,7 @@ impl TokenVault {
         caller: Address,
         ttl_seconds: u64,
     ) -> Result<(), Error> {
+        assert_not_paused(&env)?;
         let owner = get_owner(&env).ok_or(Error::NotInitialized)?;
         if caller != owner {
             return Err(Error::NotAuthorized);
@@ -884,12 +892,13 @@ impl TokenVault {
 
     // ── Emergency pause (owner-gated) ─────────────────────────────────────
 
-    /// Emergency halt: freeze all state-mutating operations.
+    /// Emergency halt: freeze all state-modifying operations.
     ///
-    /// While paused, `deposit`, `withdraw`, and `set_limit` all revert with
-    /// `ContractPaused` before touching any state. Matches the
-    /// `pause`/`unpause`/`is_paused` triple present on `DripFactory`,
-    /// `DripGovernor`, and `TwapOracle`.
+    /// While paused, every state-modifying entrypoint reverts with
+    /// `VaultPaused` before touching any state. `unpause` and the permissionless
+    /// TTL keep-alive helpers remain available so a paused vault can be
+    /// recovered and kept warm. Matches the `pause`/`unpause`/`is_paused` triple
+    /// present on `DripFactory`, `DripGovernor`, and `TwapOracle`.
     pub fn pause(env: Env, caller: Address) -> Result<(), Error> {
         let owner = get_owner(&env).ok_or(Error::NotInitialized)?;
         if caller != owner {
@@ -957,12 +966,12 @@ impl TokenVault {
     /// would replace the contract with something that cannot release escrowed
     /// funds.
     pub fn upgrade(env: Env, caller: Address, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        assert_not_paused(&env)?;
         let owner = get_owner(&env).ok_or(Error::NotInitialized)?;
         if caller != owner {
             return Err(Error::NotAuthorized);
         }
         caller.require_auth();
-        assert_not_paused(&env)?;
 
         if new_wasm_hash == BytesN::from_array(&env, &[0u8; 32]) {
             return Err(Error::InvalidWasmHash);
@@ -983,8 +992,8 @@ impl TokenVault {
         token: Address,
         amount: i128,
     ) -> Result<(), Error> {
+        assert_not_paused(&env)?;
         non_reentrant!(&env, {
-            assert_not_paused(&env)?;
             let owner = get_owner(&env).ok_or(Error::NotInitialized)?;
             require_owner_or_operator(&env, &from, &owner)?;
 
@@ -1062,8 +1071,8 @@ impl TokenVault {
         to: Address,
         amount: i128,
     ) -> Result<(), Error> {
+        assert_not_paused(&env)?;
         non_reentrant!(&env, {
-            assert_not_paused(&env)?;
             let owner = get_owner(&env).ok_or(Error::NotInitialized)?;
             require_owner_or_operator(&env, &caller, &owner)?;
 
@@ -1202,6 +1211,7 @@ impl TokenVault {
         token: Address,
         min_amount: i128,
     ) -> Result<(), Error> {
+        assert_not_paused(&env)?;
         Self::set_min_deposit_amount(env, caller, token, min_amount)
     }
 
@@ -1227,6 +1237,7 @@ impl TokenVault {
 
     /// Set the dedicated emergency administrator. Owner-only (#948).
     pub fn set_emergency_admin(env: Env, caller: Address, admin: Address) -> Result<(), Error> {
+        assert_not_paused(&env)?;
         let owner = get_owner(&env).ok_or(Error::NotInitialized)?;
         if caller != owner {
             return Err(Error::NotAuthorized);
@@ -1248,6 +1259,7 @@ impl TokenVault {
         token: Address,
         recipient: Address,
     ) -> Result<i128, Error> {
+        assert_not_paused(&env)?;
         non_reentrant!(&env, {
             let admin = get_emergency_admin(&env).ok_or(Error::NotInitialized)?;
             if caller != admin {
@@ -1281,6 +1293,7 @@ impl TokenVault {
         token: Address,
         approved: bool,
     ) -> Result<(), Error> {
+        assert_not_paused(&env)?;
         let owner = get_owner(&env).ok_or(Error::NotInitialized)?;
         if caller != owner {
             return Err(Error::NotAuthorized);
@@ -1323,8 +1336,8 @@ impl TokenVault {
         from: Address,
         amount: i128,
     ) -> Result<bool, Error> {
+        assert_not_paused(&env)?;
         non_reentrant!(&env, {
-            assert_not_paused(&env)?;
             let owner = get_owner(&env).ok_or(Error::NotInitialized)?;
             require_owner_or_operator(&env, &from, &owner)?;
             if amount <= 0 {
@@ -1387,6 +1400,7 @@ impl TokenVault {
         caller: Address,
         destination: Address,
     ) -> Result<(), Error> {
+        assert_not_paused(&env)?;
         let owner = get_owner(&env).ok_or(Error::NotInitialized)?;
         if caller != owner {
             return Err(Error::NotAuthorized);
@@ -1417,6 +1431,7 @@ impl TokenVault {
     ///
     /// Transfers all vault token balance to the configured cold storage destination.
     pub fn execute_emergency_migration(env: Env, caller: Address) -> Result<i128, Error> {
+        assert_not_paused(&env)?;
         non_reentrant!(&env, {
             let owner = get_owner(&env).ok_or(Error::NotInitialized)?;
             if caller != owner {
@@ -1449,6 +1464,7 @@ impl TokenVault {
 
     /// Cancels a pending emergency migration before or after it becomes executable (Issue #679).
     pub fn cancel_emergency_migration(env: Env, caller: Address) -> Result<(), Error> {
+        assert_not_paused(&env)?;
         let owner = get_owner(&env).ok_or(Error::NotInitialized)?;
         if caller != owner {
             return Err(Error::NotAuthorized);
@@ -1484,6 +1500,7 @@ impl TokenVault {
         strategy: Address,
         approved: bool,
     ) -> Result<(), Error> {
+        assert_not_paused(&env)?;
         let owner = get_owner(&env).ok_or(Error::NotInitialized)?;
         if caller != owner {
             return Err(Error::NotAuthorized);
@@ -1517,8 +1534,8 @@ impl TokenVault {
         strategy_vault: Address,
         amount: i128,
     ) -> Result<i128, Error> {
+        assert_not_paused(&env)?;
         non_reentrant!(&env, {
-            assert_not_paused(&env)?;
             let owner = get_owner(&env).ok_or(Error::NotInitialized)?;
             if caller != owner {
                 return Err(Error::NotAuthorized);
@@ -1529,7 +1546,7 @@ impl TokenVault {
                 return Err(Error::InvalidAmount);
             }
             if !is_token_approved(&env, &token) {
-                return Err(Error::TokenNotApproved);
+                return Err(Error::TokenNotApprovedForVault);
             }
             if !is_strategy_approved(&env, &strategy_vault) {
                 return Err(Error::StrategyNotApproved);

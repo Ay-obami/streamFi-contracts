@@ -23,8 +23,9 @@ pub enum DataKey {
     /// the operator is effectively unable to withdraw until the owner sets a
     /// positive cap.
     OperatorWithdrawLimit,
-    /// Emergency-pause flag. When `true`, all state-mutating entry points
-    /// (deposit, withdraw, set_limit) revert before touching state.
+    /// Emergency-pause flag. When `true`, all state-modifying entry points
+    /// revert with `VaultPaused` before touching state; `unpause` and TTL
+    /// keep-alive helpers remain callable.
     Paused,
     /// Pending owner address for the 2-step owner transfer.
     /// Set by `propose_owner`, consumed by `accept_owner`.
@@ -393,6 +394,7 @@ pub fn tracked_liability_for_token(env: &Env, token: &Address) -> i128 {
         }
     }
     total
+}
 
 pub fn is_strategy_approved(env: &Env, strategy: &Address) -> bool {
     env.storage()
