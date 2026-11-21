@@ -355,4 +355,64 @@ pub enum DataKey {
     /// Value: `u32` — the ledger sequence at creation
     /// Absent for streams deployed before this key was introduced.
     StreamLedger(u64),
+
+    // ── Deployment nonce (Issue #957) ───────────────────────────────────
+    /// **Persistent storage.** Next deployment nonce for a sender. Mixed into
+    /// the stream deployment salt so repeat deploys by one sender never collide.
+    /// Key: `DataKey::SenderDeployNonce(Address)` — the sender's address
+    /// Value: `u64` — the nonce the next deployment will use. Missing entry is `0`.
+    /// TTL: bumped with `ttl::bump_persistent` on every write.
+    SenderDeployNonce(Address),
+
+    // ── Active stream count (issue #960) ──────────────────────────────
+    /// **Persistent storage.** Number of streams created by this factory that
+    /// have not yet been cancelled. Gives an O(1) protocol statistic instead of
+    /// enumerating every `StreamAddr` entry.
+    /// Key: `DataKey::ActiveStreamCount` (no inner type, discriminant only)
+    /// Value: `u64`. A missing entry reads as `0`. Written only through
+    /// `write_active_stream_count` / `increment_active_stream_count` /
+    /// `decrement_active_stream_count` below, which renew the TTL.
+    ActiveStreamCount,
+}
+
+// ── Active stream count (issue #960) ──────────────────────────────────────
+// Persistent counter kept in step with `Aggregate::active_streams`. Every
+// read and write goes through these helpers so the TTL policy lives in one
+// place. Call sites: `create_stream_with_config` (increment),
+// `cancel_batch_streams` and `record_cancel` (decrement, first cancellation
+// only).
+
+/// Reads `DataKey::ActiveStreamCount`. A missing entry (never written, or
+/// expired and not yet re-written) reads as `0`.
+pub fn read_active_stream_count(env: &soroban_sdk::Env) -> u64 {
+    env.storage()
+        .persistent()
+        .get::<_, u64>(&DataKey::ActiveStreamCount)
+        .unwrap_or(0)
+}
+
+/// Writes `DataKey::ActiveStreamCount` and renews its persistent TTL with the
+/// shared `ttl::bump_persistent` helper.
+pub fn write_active_stream_count(env: &soroban_sdk::Env, count: u64) {
+    let key = DataKey::ActiveStreamCount;
+    env.storage().persistent().set(&key, &count);
+    crate::ttl::bump_persistent(env, &key);
+}
+
+/// Adds one to the active count and returns the new value. Panics on `u64`
+/// overflow, matching the `Aggregate::active_streams` update in create.
+pub fn increment_active_stream_count(env: &soroban_sdk::Env) -> u64 {
+    let next = read_active_stream_count(env)
+        .checked_add(1)
+        .expect("active_stream_count overflow");
+    write_active_stream_count(env, next);
+    next
+}
+
+/// Subtracts one from the active count, saturating at zero, and returns the
+/// new value.
+pub fn decrement_active_stream_count(env: &soroban_sdk::Env) -> u64 {
+    let next = read_active_stream_count(env).saturating_sub(1);
+    write_active_stream_count(env, next);
+    next
 }

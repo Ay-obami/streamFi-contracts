@@ -91,6 +91,8 @@ pub enum Role {
     RateManager,
     Pauser,
     Executor,
+    /// May emergency-cancel queued (Pending or Active) proposals (Issue #968).
+    SecurityGuardian,
 }
 
 /// Composite key identifying a single (role, account) grant.
@@ -181,6 +183,8 @@ pub enum DataKey {
     VoteRecord(u64),
     /// Abstain-vote tally for proposal `u64`.
     ProposalAbstainVotes(u64),
+    /// Timelock delay in seconds between proposal creation and execution (Issue #967).
+    TimelockDelaySecs,
 }
 
 /// Adds `proposal_id` to the status index for `status` if it is not present.

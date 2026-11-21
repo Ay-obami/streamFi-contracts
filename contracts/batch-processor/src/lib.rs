@@ -134,6 +134,19 @@ pub struct BatchResult {
     pub error_code: Option<u32>,
 }
 
+/// Per-execution summary of a batch (Issue #965).
+///
+/// `total` is the number of items attempted, `successful` the number that
+/// succeeded, and `failed_indices` the 0-based positions of the failed items
+/// in input order.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchExecutionSummary {
+    pub total: u32,
+    pub successful: u32,
+    pub failed_indices: Vec<u32>,
+}
+
 /// Outcome of a deterministically capped batch transfer.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -234,6 +247,31 @@ fn batch_emergency_toggle(
 fn event_upgraded(env: &Env, caller: &Address, upgraded_at: u64) {
     env.events()
         .publish((symbol_short!("upgraded"), caller.clone()), upgraded_at);
+}
+
+/// Emitted at the end of `batch_withdraw_lenient` (Issue #965).
+///
+/// Topics: `("batch_stream_summary", contract)`.
+/// Data:   [`BatchExecutionSummary`] built from the per-item results.
+fn event_batch_summary(env: &Env, contract: &Address, results: &Vec<(Address, bool, u32)>) {
+    let mut successful: u32 = 0;
+    let mut failed_indices = Vec::new(env);
+    for (idx, (_, ok, _)) in results.iter().enumerate() {
+        if ok {
+            successful += 1;
+        } else {
+            failed_indices.push_back(idx as u32);
+        }
+    }
+    let summary = BatchExecutionSummary {
+        total: results.len(),
+        successful,
+        failed_indices,
+    };
+    env.events().publish(
+        (Symbol::new(env, "batch_stream_summary"), contract.clone()),
+        summary,
+    );
 }
 
 /// Checks 1–4 of the documented `process_batch` validation order: length,
@@ -931,6 +969,8 @@ impl BatchTransferProcessor {
             stream_ids.len(),
             started_at,
         );
+
+        event_batch_summary(&env, &env.current_contract_address(), &results);
 
         Ok(results)
     }

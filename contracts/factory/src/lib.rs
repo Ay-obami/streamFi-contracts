@@ -391,8 +391,17 @@ impl DripFactory {
             metadata.into_val(&env),
         ];
 
-        let stream_addr = match deploy::deploy_stream(&env, &wasm_hash, stream_id, init_args) {
-            Ok(addr) => addr,
+        // The salt is derived from sender, recipient, a per-sender nonce and token (#957).
+        let (stream_addr, salt) = match deploy::deploy_stream(
+            &env,
+            &wasm_hash,
+            stream_id,
+            &sender,
+            &recipient,
+            &token,
+            init_args,
+        ) {
+            Ok(pair) => pair,
             Err(e) => {
                 env.storage().instance().set(&DataKey::CreateLock, &false);
                 return Err(e);
@@ -408,7 +417,6 @@ impl DripFactory {
         }
 
         // Emit StreamCreated event including salt and wasm_hash (Issue #684)
-        let salt = deploy::compute_salt(&env, stream_id);
         events::stream_created(&env, &sender, &recipient, &stream_addr, &salt, &wasm_hash);
 
         // ── Index ─────────────────────────────────────────────────────────
@@ -472,6 +480,8 @@ impl DripFactory {
         env.storage()
             .instance()
             .set(&DataKey::Aggregate, &aggregate);
+        // Keep the persistent active-stream count in step (#960).
+        storage::increment_active_stream_count(&env);
 
         // Persistent storage entry 2 — BySender (paged):
         //   Key:   DataKey::BySenderPage(sender, page)
@@ -760,6 +770,7 @@ impl DripFactory {
                 env.storage()
                     .instance()
                     .set(&DataKey::Aggregate, &aggregate);
+                storage::decrement_active_stream_count(&env);
             }
         }
 
@@ -853,6 +864,14 @@ impl DripFactory {
         env.storage()
             .instance()
             .set(&DataKey::Aggregate, &aggregate);
+        storage::decrement_active_stream_count(&env);
+    }
+
+    /// Paged list of every stream address this factory deployed, in creation
+    /// order (#959). `offset` is the first stream ID to read; `limit` is clamped
+    /// to the query's maximum page size.
+    pub fn get_all_streams(env: Env, offset: u32, limit: u32) -> Vec<Address> {
+        query::get_streams_paged(&env, offset, limit)
     }
     /// Paginated list of stream IDs created by `sender`, paired with the
     /// sender's total stream count.

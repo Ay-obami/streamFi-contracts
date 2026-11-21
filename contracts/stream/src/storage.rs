@@ -21,7 +21,7 @@ pub const FLAG_REGULATED_ASSET: u32 = 1 << 3;
 pub const CURRENT_STORAGE_VERSION: u32 = 1;
 
 #[contracttype]
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub enum DataKey {
     /// Single-key representation of all stream fields.
     /// Consolidates all stream metadata into one storage read instead of eleven
@@ -181,12 +181,16 @@ pub struct RateCheckpoint {
     pub at: u64,
 }
 
-/// Stream configuration including cancelability and optional reconciliation memo (Issues #685, #803).
+/// Stream configuration including cancelability and optional reconciliation memo (Issues #685, #803, #938).
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StreamConfig {
     pub is_cancelable: bool,
     pub memo: Option<String>,
+    /// Optional cliff unlock percentage in basis points (Issue #938).
+    /// When set, this percentage of the vested amount unlocks immediately at cliff.
+    /// Valid range: 0-10000 (0% to 100%). E.g., 1000 means 10% unlocks at cliff.
+    pub cliff_unlock_bps: Option<u32>,
 }
 
 /// Operational status of a stream.
@@ -261,6 +265,14 @@ impl StreamInfo {
         self.flags |= FLAG_REGULATED_ASSET;
     }
 
+    /// Explicit cumulative payout counter (Issue #936).
+    ///
+    /// `withdrawn` is persisted independently from the contract's live token
+    /// balance; exposing it by name avoids reconstructing historical events.
+    pub fn total_withdrawn(&self) -> i128 {
+        self.withdrawn
+    }
+
     /// True when all deposited stream funds have been completely withdrawn or stream is ended and fully drained (Issue #753).
     pub fn is_depleted(&self) -> bool {
         if self.is_cancelled() {
@@ -295,6 +307,15 @@ impl StreamInfo {
             current_time
         };
         effective_end.saturating_sub(self.start_time)
+    }
+
+    /// Check if the stream is in a cancellable state (Issue #937).
+    ///
+    /// A stream can be cancelled if it has not already been cancelled.
+    /// The caller authorization (sender vs recipient permissions) is checked
+    /// at the contract method level.
+    pub fn is_in_cancellable_state(&self) -> bool {
+        !self.is_cancelled()
     }
 }
 

@@ -9,7 +9,7 @@ use soroban_sdk::{
     token, Address, Env, IntoVal, Symbol, TryFromVal, TryIntoVal, Vec,
 };
 
-use crate::{BatchTransferProcessorClient, Error};
+use crate::{BatchExecutionSummary, BatchTransferProcessorClient, Error};
 
 /// Mirrors `MAX_BATCH_SIZE` — the value `max_batch_size()` must expose and
 /// the cap `process_batch` enforces (reduced to 30 per issue #677).
@@ -974,6 +974,83 @@ fn test_batch_withdraw_lenient_validation_guards() {
         s.client.try_batch_withdraw_lenient(&stream_ids, &amounts),
         Err(Ok(Error::LengthMismatch))
     );
+}
+
+// ── Issue #965: batch execution summary event ───────────────────────────────
+
+#[test]
+fn batch_withdraw_lenient_emits_execution_summary_with_failure_indices() {
+    let s = Setup::new();
+    let stream_success = s.env.register_contract(None, MockStreamContract);
+    let stream_fail = s.env.register_contract(None, MockStreamContract);
+
+    let mut stream_ids = Vec::new(&s.env);
+    stream_ids.push_back(stream_success);
+    stream_ids.push_back(stream_fail);
+
+    // Index 1 fails inside the mock (amount 999 -> NotAuthorized).
+    let amounts = s.amounts(&[100, 999]);
+    s.client.batch_withdraw_lenient(&stream_ids, &amounts);
+
+    // The summary is published last, after the per-batch lenient event.
+    let events = s.processor_events();
+    let (_, _, data) = events.last().unwrap();
+    let summary = BatchExecutionSummary::try_from_val(&s.env, data).unwrap();
+    assert_eq!(summary.total, 2);
+    assert_eq!(summary.successful, 1);
+    assert_eq!(summary.failed_indices.len(), 1);
+    assert_eq!(summary.failed_indices.get(0).unwrap(), 1);
+}
+
+// ── Issue #966: strict batch rollback with a mixed valid/invalid recipient set ──
+
+#[test]
+fn process_batch_rolls_back_entirely_when_one_recipient_is_invalid() {
+    let s = Setup::new();
+    let valid_a = Address::generate(&s.env);
+    let invalid = Address::generate(&s.env);
+    let valid_b = Address::generate(&s.env);
+
+    let mut recipients = Vec::new(&s.env);
+    recipients.push_back(valid_a.clone());
+    recipients.push_back(invalid.clone());
+    recipients.push_back(valid_b.clone());
+
+    // The middle recipient carries an invalid (zero) amount, so the batch
+    // must fail as a whole in strict mode.
+    let amounts = s.amounts(&[100, 0, 300]);
+
+    let funder_before = s.token.balance(&s.funder);
+    let contract_before = s.token.balance(&s.client.address);
+
+    assert_eq!(
+        s.client
+            .try_process_batch(&s.funder, &s.token_addr, &recipients, &amounts),
+        Err(Ok(Error::InvalidAmount))
+    );
+
+    // No funds moved: funder untouched, no recipient paid, contract empty.
+    assert_eq!(s.token.balance(&s.funder), funder_before);
+    assert_eq!(s.token.balance(&valid_a), 0);
+    assert_eq!(s.token.balance(&invalid), 0);
+    assert_eq!(s.token.balance(&valid_b), 0);
+    assert_eq!(s.token.balance(&s.client.address), contract_before);
+
+    // No success event was published for the reverted batch.
+    assert!(s.processor_events().is_empty());
+
+    // The processor is still usable afterwards (no leftover reentrancy lock
+    // or partial state).
+    let mut ok_recipients = Vec::new(&s.env);
+    ok_recipients.push_back(valid_a.clone());
+    ok_recipients.push_back(valid_b.clone());
+    assert_eq!(
+        s.client
+            .process_batch(&s.funder, &s.token_addr, &ok_recipients, &s.amounts(&[100, 300])),
+        400
+    );
+    assert_eq!(s.token.balance(&valid_a), 100);
+    assert_eq!(s.token.balance(&valid_b), 300);
 }
 
 // ── Issue #762: TTL extension helpers ───────────────────────────────────────

@@ -9,6 +9,9 @@ use crate::Error;
 /// Prevents flash-loan voting attacks and allows DAO participants time to react.
 pub const MIN_VOTING_PERIOD_LEDGERS: u32 = 17280;
 
+/// Default timelock delay between proposal creation and execution: 48 hours (Issue #967).
+pub const DEFAULT_TIMELOCK_DELAY_SECS: u64 = 172_800;
+
 #[contracttype]
 #[derive(Clone)]
 pub struct GovernorConfig {
@@ -31,6 +34,9 @@ pub struct GovernorConfig {
     pub proposal_stake_token: Option<Address>,
     /// Minimum token amount required to create a proposal.
     pub min_proposal_stake: i128,
+    /// Seconds that must elapse between proposal creation and execution (Issue #967).
+    /// Governance-configurable via `set_timelock_delay`.
+    pub timelock_delay_secs: u64,
 }
 
 /// Load the governor configuration from instance storage.
@@ -61,6 +67,9 @@ pub fn load(env: &Env) -> Result<GovernorConfig, Error> {
         voting_period_ledgers: s.get(&DataKey::VotingPeriodLedgers).unwrap_or(MIN_VOTING_PERIOD_LEDGERS),
         proposal_stake_token: s.get(&DataKey::ProposalStakeToken),
         min_proposal_stake: s.get(&DataKey::MinProposalStake).unwrap_or(0),
+        timelock_delay_secs: s
+            .get(&DataKey::TimelockDelaySecs)
+            .unwrap_or(DEFAULT_TIMELOCK_DELAY_SECS),
     })
 }
 
@@ -108,6 +117,15 @@ pub fn get_voting_period(env: &Env) -> u32 {
         .instance()
         .get(&DataKey::VotingPeriodLedgers)
         .unwrap_or(MIN_VOTING_PERIOD_LEDGERS)
+}
+
+/// Store the timelock delay in seconds (Issue #967).
+///
+/// Authority is checked by the caller; this only writes the value.
+pub fn set_timelock_delay(env: &Env, timelock_delay_secs: u64) {
+    env.storage()
+        .instance()
+        .set(&DataKey::TimelockDelaySecs, &timelock_delay_secs);
 }
 
 /// Validate and store a proposal token stake threshold.

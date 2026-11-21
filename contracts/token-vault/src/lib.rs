@@ -12,18 +12,17 @@ use drip_stream::DripStreamClient;
 use errors::Error;
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Env, Map, Vec};
 use storage::{
-    check_vault_balance, get_depositor_token_balance, get_emergency_migration, get_max_limit,
-    get_operator, get_operator_withdraw_limit, get_owner, get_owner_proposal_ttl,
-    get_pending_owner, get_pending_owner_proposed_at, get_pending_owner_proposer,
-    get_strategy_swept, get_token, get_token_account_balance, get_token_max_limit,
-    get_token_min_deposit, is_paused, is_strategy_approved, is_token_approved,
-    record_vault_balance, remove_emergency_migration, remove_operator, remove_pending_owner,
-    remove_pending_owner_proposed_at, remove_pending_owner_proposer, set_depositor_token_balance,
-    set_emergency_migration, set_max_limit, set_operator, set_operator_withdraw_limit, set_owner,
-    set_owner_proposal_ttl as store_owner_proposal_ttl, set_paused, set_pending_owner,
-    set_pending_owner_proposed_at, set_pending_owner_proposer, set_strategy_approved,
-    set_strategy_swept, set_token, set_token_account_balance, set_token_approved,
-    set_token_max_limit, set_token_min_deposit, DataKey, EmergencyMigration,
+    check_vault_balance, get_depositor_token_balance, get_emergency_admin, get_emergency_migration,
+    get_max_limit, get_operator, get_operator_withdraw_limit, get_owner, get_owner_proposal_ttl,
+    get_pending_owner, get_pending_owner_proposed_at, get_pending_owner_proposer, get_strategy_swept,
+    get_token, get_token_account_balance, get_token_max_limit, get_token_min_deposit, is_paused,
+    is_strategy_approved, is_token_approved, record_vault_balance, remove_emergency_migration,
+    remove_operator, remove_pending_owner, remove_pending_owner_proposed_at, remove_pending_owner_proposer,
+    set_depositor_token_balance, set_emergency_admin, set_emergency_migration, set_max_limit, set_operator,
+    set_operator_withdraw_limit, set_owner, set_owner_proposal_ttl as store_owner_proposal_ttl, set_paused,
+    set_pending_owner, set_pending_owner_proposed_at, set_pending_owner_proposer, set_strategy_approved,
+    set_strategy_swept, set_token, set_token_account_balance, set_token_approved, set_token_max_limit,
+    set_token_min_deposit, tracked_liability_for_token, DataKey, EmergencyMigration,
 };
 use ttl::bump_instance;
 
@@ -262,6 +261,7 @@ impl TokenVault {
 
         bump_instance(&env);
         set_owner(&env, &owner);
+        set_emergency_admin(&env, &owner);
         set_token(&env, &token);
         set_token_approved(&env, &token, true);
         set_max_limit(&env, &max_limit);
@@ -505,9 +505,7 @@ impl TokenVault {
                 } else {
                     match expected_balance.checked_add(deposit.amount) {
                         None => Some(Error::ArithmeticOverflow as u32),
-                        Some(projected) if projected > max => {
-                            Some(Error::LimitExceeded as u32)
-                        }
+                        Some(projected) if projected > max => Some(Error::LimitExceeded as u32),
                         Some(_) => None,
                     }
                 };
@@ -539,15 +537,13 @@ impl TokenVault {
                     .checked_add(deposit.amount)
                     .ok_or(Error::ArithmeticOverflow)?;
 
-                let cur_acc_bal =
-                    get_token_account_balance(&env, &default_token, &deposit.from);
+                let cur_acc_bal = get_token_account_balance(&env, &default_token, &deposit.from);
                 let new_acc_bal = cur_acc_bal
                     .checked_add(deposit.amount)
                     .ok_or(Error::ArithmeticOverflow)?;
                 set_token_account_balance(&env, &default_token, &deposit.from, new_acc_bal);
 
-                let cur_dep_bal =
-                    get_depositor_token_balance(&env, &deposit.from, &default_token);
+                let cur_dep_bal = get_depositor_token_balance(&env, &deposit.from, &default_token);
                 let new_dep_bal = cur_dep_bal
                     .checked_add(deposit.amount)
                     .ok_or(Error::ArithmeticOverflow)?;
@@ -1222,6 +1218,54 @@ impl TokenVault {
     /// Read-only: pre-flight check validating that target token adheres to standard SEP-0041 interface (Issue #696).
     pub fn is_token_compliant(env: Env, token: Address) -> bool {
         validate_sep41_token(&env, &token).is_ok()
+    }
+
+    /// Set the dedicated emergency administrator. Owner-only (#948).
+    pub fn set_emergency_admin(env: Env, caller: Address, admin: Address) -> Result<(), Error> {
+        let owner = get_owner(&env).ok_or(Error::NotInitialized)?;
+        if caller != owner {
+            return Err(Error::NotAuthorized);
+        }
+        caller.require_auth();
+        set_emergency_admin(&env, &admin);
+        bump_instance(&env);
+        Ok(())
+    }
+
+    /// Recover tokens accidentally sent directly to the vault (#948).
+    ///
+    /// Only the emergency administrator may call this. The function sweeps
+    /// exactly the token balance above tracked account liabilities, so stream/
+    /// depositor backing can never be removed through this escape hatch.
+    pub fn emergency_sweep(
+        env: Env,
+        caller: Address,
+        token: Address,
+        recipient: Address,
+    ) -> Result<i128, Error> {
+        non_reentrant!(&env, {
+            let admin = get_emergency_admin(&env).ok_or(Error::NotInitialized)?;
+            if caller != admin {
+                return Err(Error::NotAuthorized);
+            }
+            caller.require_auth();
+            validate_sep41_token(&env, &token)?;
+
+            let tk = token::Client::new(&env, &token);
+            let actual = tk.balance(&env.current_contract_address());
+            let locked = tracked_liability_for_token(&env, &token);
+            let sweepable = actual
+                .checked_sub(locked)
+                .ok_or(Error::ArithmeticOverflow)?;
+            if sweepable <= 0 {
+                return Err(Error::NothingToSweep);
+            }
+
+            tk.transfer(&env.current_contract_address(), &recipient, &sweepable);
+            record_vault_balance(&env, &token, actual - sweepable);
+            bump_instance(&env);
+            Ok(sweepable)
+        })
     }
 
     /// Owner-maintained audited token contract allowlist (issue #812).

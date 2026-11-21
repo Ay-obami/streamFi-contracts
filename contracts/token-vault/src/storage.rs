@@ -4,6 +4,8 @@ use soroban_sdk::{contracttype, Address, Env, Vec};
 #[derive(Clone)]
 pub enum DataKey {
     Owner,
+    /// Dedicated protocol emergency administrator (#948).
+    EmergencyAdmin,
     Token,
     MaxLimit,
     Balance,
@@ -79,6 +81,16 @@ pub fn set_owner(env: &Env, a: &Address) {
 
 pub fn get_owner(env: &Env) -> Option<Address> {
     env.storage().instance().get(&DataKey::Owner)
+}
+
+pub fn set_emergency_admin(env: &Env, admin: &Address) {
+    env.storage()
+        .instance()
+        .set(&DataKey::EmergencyAdmin, admin);
+}
+
+pub fn get_emergency_admin(env: &Env) -> Option<Address> {
+    env.storage().instance().get(&DataKey::EmergencyAdmin)
 }
 
 pub fn set_token(env: &Env, t: &Address) {
@@ -223,10 +235,7 @@ pub fn set_token_account_balance(env: &Env, token: &Address, account: &Address, 
 pub fn get_depositor_token_balance(env: &Env, depositor: &Address, token: &Address) -> i128 {
     env.storage()
         .persistent()
-        .get(&DataKey::DepositorTokens(
-            depositor.clone(),
-            token.clone(),
-        ))
+        .get(&DataKey::DepositorTokens(depositor.clone(), token.clone()))
         .unwrap_or(0)
 }
 
@@ -340,6 +349,18 @@ pub fn tracked_vault_keys(env: &Env) -> Vec<DataKey> {
         .get(&DataKey::TrackedVaultKeys)
         .unwrap_or(Vec::new(env))
 }
+
+/// Sum tracked account liabilities for one token (#948).
+pub fn tracked_liability_for_token(env: &Env, token: &Address) -> i128 {
+    let mut total = 0_i128;
+    for key in tracked_vault_keys(env).iter() {
+        if let DataKey::TokenAccountBalance(key_token, account) = key {
+            if key_token == *token {
+                total = total.saturating_add(get_token_account_balance(env, &key_token, &account));
+            }
+        }
+    }
+    total
 
 pub fn is_strategy_approved(env: &Env, strategy: &Address) -> bool {
     env.storage()

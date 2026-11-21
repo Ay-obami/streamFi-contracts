@@ -58,6 +58,25 @@ pub fn assert_not_cancelled(info: &StreamInfo) -> Result<(), Error> {
     }
 }
 
+/// Check if a stream is in a cancellable state (Issue #937).
+///
+/// Returns `true` if the stream can be cancelled:
+/// - Stream is not already cancelled
+/// - Stream has not been fully completed/withdrawn
+///
+/// The caller authorization (sender permissions, recipient restrictions) should be
+/// validated separately at the contract method level using stream config and address.
+pub fn is_cancellable(info: &StreamInfo) -> Result<bool, Error> {
+    // Stream cannot be cancelled if it's already in a terminal cancelled state
+    if info.is_cancelled() {
+        return Ok(false);
+    }
+
+    // Stream can be cancelled as long as it's not fully cancelled
+    // Other authorization checks (sender, recipient, etc.) are done at the method level
+    Ok(info.is_in_cancellable_state())
+}
+
 /// Maximum allowed re-entrancy depth. Must never be > 1 in production —
 /// Soroban's execution model makes re-entrancy structurally impossible,
 /// so any depth > 0 signals a bug or an emerging cross-contract callback
