@@ -500,7 +500,7 @@ where
 
     let mut prev_admin = None;
     for i in 0..all_members.len() {
-        if let Ok(m) = all_members.get(i) {
+        if let Some(m) = all_members.get(i) {
             prev_admin = Some(m);
             break;
         }

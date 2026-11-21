@@ -283,6 +283,30 @@ pub fn recipient_transferred(env: &Env, previous_recipient: &Address, new_recipi
     );
 }
 
+pub fn recipient_transfer_proposed(
+    env: &Env,
+    current_recipient: &Address,
+    new_recipient: &Address,
+) {
+    let sequence = next_sequence(env);
+    env.events().publish(
+        (
+            Symbol::new(env, "StreamRecipientTransferProposed"),
+            current_recipient.clone(),
+            sequence,
+        ),
+        (current_recipient.clone(), new_recipient.clone()),
+    );
+    env.events().publish(
+        (
+            symbol_short!("prop_rec"),
+            current_recipient.clone(),
+            sequence,
+        ),
+        (current_recipient.clone(), new_recipient.clone()),
+    );
+}
+
 pub fn operator_set(env: &Env, sender: &Address, operator: &Address) {
     let sequence = next_sequence(env);
     env.events().publish(

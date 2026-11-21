@@ -110,6 +110,19 @@ pub enum DataKey {
     CancelDelegate,
     /// Delegate the recipient allowed to claim on its behalf via `claim_for` (#878).
     ClaimDelegate,
+    /// Compact bitfield storing boolean stream status flags (#882).
+    StatusFlags,
+    /// Optional non-linear vesting curve configuration (#883).
+    VestingCurve,
+    RecipientProposal,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecipientProposal {
+    pub current_recipient: Address,
+    pub new_recipient: Address,
+    pub proposed_at: u64,
 }
 
 /// Claim delegate granted by a recipient (#878). The grant is tied to the
@@ -119,10 +132,6 @@ pub enum DataKey {
 pub struct ClaimDelegateConfig {
     pub recipient: Address,
     pub delegate: Address,
-    /// Compact bitfield storing boolean stream status flags (#882).
-    StatusFlags,
-    /// Optional non-linear vesting curve configuration (#883).
-    VestingCurve,
 }
 
 /// Emergency cancellation delegate with a time-bounded expiration timestamp (#886).
