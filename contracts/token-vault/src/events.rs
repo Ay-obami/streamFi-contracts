@@ -294,6 +294,24 @@ pub fn token_approval_changed(env: &Env, token: &Address, approved: bool) {
         .publish((symbol_short!("tok_allow"), token.clone()), approved);
 }
 
+pub fn strategy_approval_changed(env: &Env, strategy: &Address, approved: bool) {
+    env.events()
+        .publish((symbol_short!("strat_ok"), strategy.clone()), approved);
+}
+
+pub fn swept_to_strategy(
+    env: &Env,
+    caller: &Address,
+    token: &Address,
+    strategy: &Address,
+    amount: i128,
+) {
+    env.events().publish(
+        (symbol_short!("swept"), token.clone(), strategy.clone()),
+        (caller.clone(), amount),
+    );
+}
+
 pub fn vault_keys_refreshed(env: &Env, count: u32) {
     env.events().publish((symbol_short!("keys_ttl"),), count);
 }

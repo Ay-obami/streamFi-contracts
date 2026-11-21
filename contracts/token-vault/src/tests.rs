@@ -1862,3 +1862,131 @@ fn test_min_deposit_amount_threshold_enforcement() {
     assert_eq!(res_batch_below, Err(Ok(Error::DepositBelowMin)));
 }
 
+// ── Issue #893: governance-permissioned yield strategy sweeping ─────────────
+
+#[test]
+fn sweep_to_strategy_moves_idle_tokens_and_tracks_totals() {
+    let s = Setup::new(1_000_000);
+    let strategy = Address::generate(&s.env);
+    s.client.deposit(&s.owner, &10_000);
+
+    s.client.approve_strategy(&s.owner, &strategy, &true);
+    assert!(s.client.is_strategy_approved(&strategy));
+
+    let total = s
+        .client
+        .sweep_to_strategy(&s.owner, &s.token.address, &strategy, &4_000);
+    assert_eq!(total, 4_000);
+    assert_eq!(s.token.balance(&strategy), 4_000);
+    assert_eq!(s.token.balance(&s.client.address), 6_000);
+
+    let total = s
+        .client
+        .sweep_to_strategy(&s.owner, &s.token.address, &strategy, &1_000);
+    assert_eq!(total, 5_000);
+    assert_eq!(s.client.strategy_swept(&s.token.address, &strategy), 5_000);
+
+    let swept_events = s
+        .env
+        .events()
+        .all()
+        .iter()
+        .filter(|(contract, topics, _)| {
+            contract == &s.client.address
+                && topics.get(0).map(|t| {
+                    <Symbol as soroban_sdk::TryFromVal<Env, soroban_sdk::Val>>::try_from_val(
+                        &s.env, &t,
+                    )
+                    .ok()
+                        == Some(symbol_short!("swept"))
+                }) == Some(true)
+        })
+        .count();
+    assert!(swept_events >= 1, "sweep must publish a `swept` event");
+}
+
+#[test]
+fn sweep_to_strategy_requires_governance_owner() {
+    let s = Setup::new(1_000_000);
+    let strategy = Address::generate(&s.env);
+    s.client.deposit(&s.owner, &10_000);
+    s.client.approve_strategy(&s.owner, &strategy, &true);
+
+    assert_eq!(
+        s.client
+            .try_sweep_to_strategy(&s.user, &s.token.address, &strategy, &1_000),
+        Err(Ok(Error::NotAuthorized))
+    );
+    assert_eq!(
+        s.client.try_approve_strategy(&s.user, &strategy, &true),
+        Err(Ok(Error::NotAuthorized))
+    );
+    assert_eq!(s.token.balance(&strategy), 0);
+}
+
+#[test]
+fn sweep_to_strategy_rejects_unapproved_targets_and_tokens() {
+    let s = Setup::new(1_000_000);
+    let strategy = Address::generate(&s.env);
+    s.client.deposit(&s.owner, &10_000);
+
+    assert_eq!(
+        s.client
+            .try_sweep_to_strategy(&s.owner, &s.token.address, &strategy, &1_000),
+        Err(Ok(Error::StrategyNotApproved))
+    );
+
+    s.client.approve_strategy(&s.owner, &strategy, &true);
+    let other_token = s
+        .env
+        .register_stellar_asset_contract_v2(Address::generate(&s.env))
+        .address();
+    assert_eq!(
+        s.client
+            .try_sweep_to_strategy(&s.owner, &other_token, &strategy, &1_000),
+        Err(Ok(Error::TokenNotApproved))
+    );
+
+    // Revocation blocks further sweeps.
+    s.client.approve_strategy(&s.owner, &strategy, &false);
+    assert_eq!(
+        s.client
+            .try_sweep_to_strategy(&s.owner, &s.token.address, &strategy, &1_000),
+        Err(Ok(Error::StrategyNotApproved))
+    );
+
+    // The vault itself can never be approved as a strategy.
+    assert_eq!(
+        s.client
+            .try_approve_strategy(&s.owner, &s.client.address, &true),
+        Err(Ok(Error::InvalidParam))
+    );
+}
+
+#[test]
+fn sweep_to_strategy_validates_amount_liquidity_and_pause() {
+    let s = Setup::new(1_000_000);
+    let strategy = Address::generate(&s.env);
+    s.client.deposit(&s.owner, &10_000);
+    s.client.approve_strategy(&s.owner, &strategy, &true);
+
+    assert_eq!(
+        s.client
+            .try_sweep_to_strategy(&s.owner, &s.token.address, &strategy, &0),
+        Err(Ok(Error::InvalidAmount))
+    );
+    assert_eq!(
+        s.client
+            .try_sweep_to_strategy(&s.owner, &s.token.address, &strategy, &10_001),
+        Err(Ok(Error::InsufficientVaultLiquidity))
+    );
+
+    s.client.pause(&s.owner);
+    assert_eq!(
+        s.client
+            .try_sweep_to_strategy(&s.owner, &s.token.address, &strategy, &1_000),
+        Err(Ok(Error::ContractPaused))
+    );
+    assert_eq!(s.token.balance(&strategy), 0);
+    assert_eq!(s.client.strategy_swept(&s.token.address, &strategy), 0);
+}

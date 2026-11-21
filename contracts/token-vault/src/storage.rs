@@ -52,6 +52,10 @@ pub enum DataKey {
     DepositorTokens(Address, Address),
     /// Persistent storage: optional minimum deposit amount threshold per token (Issue #756).
     TokenMinDeposit(Address),
+    /// Governance-approved yield strategy vault that may receive swept tokens (Issue #893).
+    ApprovedStrategy(Address),
+    /// Running total of `token` swept into `strategy` (Issue #893).
+    StrategySwept(Address, Address),
 }
 
 #[contracttype]
@@ -335,4 +339,31 @@ pub fn tracked_vault_keys(env: &Env) -> Vec<DataKey> {
         .instance()
         .get(&DataKey::TrackedVaultKeys)
         .unwrap_or(Vec::new(env))
+}
+
+pub fn is_strategy_approved(env: &Env, strategy: &Address) -> bool {
+    env.storage()
+        .instance()
+        .get(&DataKey::ApprovedStrategy(strategy.clone()))
+        .unwrap_or(false)
+}
+
+pub fn set_strategy_approved(env: &Env, strategy: &Address, approved: bool) {
+    env.storage()
+        .instance()
+        .set(&DataKey::ApprovedStrategy(strategy.clone()), &approved);
+}
+
+pub fn get_strategy_swept(env: &Env, token: &Address, strategy: &Address) -> i128 {
+    env.storage()
+        .instance()
+        .get(&DataKey::StrategySwept(token.clone(), strategy.clone()))
+        .unwrap_or(0)
+}
+
+pub fn set_strategy_swept(env: &Env, token: &Address, strategy: &Address, total: i128) {
+    env.storage().instance().set(
+        &DataKey::StrategySwept(token.clone(), strategy.clone()),
+        &total,
+    );
 }

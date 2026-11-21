@@ -423,3 +423,120 @@ mod tests {
         assert_eq!(max_streamed, initial);
     }
 }
+
+/// Rounding direction for [`interpolate_vested`] (#879).
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoundingMode {
+    RoundUp,
+    RoundDown,
+}
+
+/// Linear vesting `total * elapsed / duration` with an explicit rounding
+/// mode, overflow free for any `i128` total and `u64` times (#879).
+///
+/// `elapsed` is clamped to `duration`, so at or after completion the result
+/// is exactly `total`, never more, and no rounding dust is left behind. A
+/// zero `duration` counts as fully vested; a non-positive `total` vests
+/// nothing.
+#[allow(dead_code)]
+pub fn interpolate_vested(
+    elapsed: u64,
+    duration: u64,
+    total: i128,
+    rounding: RoundingMode,
+) -> i128 {
+    if total <= 0 {
+        return 0;
+    }
+    if duration == 0 || elapsed >= duration {
+        return total;
+    }
+
+    let (total, elapsed, duration) = (total as u128, elapsed as u128, duration as u128);
+    // Split total = q * duration + r so neither product can overflow:
+    // q * elapsed <= total, and r * elapsed < duration^2 < 2^128.
+    let (q, r) = (total / duration, total % duration);
+    let partial = r * elapsed;
+    let mut vested = q * elapsed + partial / duration;
+    if rounding == RoundingMode::RoundUp && partial % duration != 0 {
+        vested += 1;
+    }
+    vested as i128
+}
+
+#[cfg(test)]
+mod interpolate_tests {
+    use super::*;
+
+    #[test]
+    fn exact_division_is_the_same_in_both_modes() {
+        for mode in [RoundingMode::RoundDown, RoundingMode::RoundUp] {
+            assert_eq!(interpolate_vested(25, 100, 1_000, mode), 250);
+        }
+    }
+
+    #[test]
+    fn modes_differ_by_one_on_a_fraction() {
+        // 10 * 1 / 3 = 3.33...
+        assert_eq!(interpolate_vested(1, 3, 10, RoundingMode::RoundDown), 3);
+        assert_eq!(interpolate_vested(1, 3, 10, RoundingMode::RoundUp), 4);
+    }
+
+    #[test]
+    fn completion_returns_exactly_the_total() {
+        for mode in [RoundingMode::RoundDown, RoundingMode::RoundUp] {
+            assert_eq!(interpolate_vested(7, 7, 10, mode), 10);
+            assert_eq!(interpolate_vested(u64::MAX, 7, 10, mode), 10);
+        }
+    }
+
+    #[test]
+    fn edge_inputs() {
+        assert_eq!(interpolate_vested(5, 0, 10, RoundingMode::RoundDown), 10);
+        assert_eq!(interpolate_vested(0, 100, 10, RoundingMode::RoundUp), 0);
+        assert_eq!(interpolate_vested(50, 100, 0, RoundingMode::RoundUp), 0);
+        assert_eq!(interpolate_vested(50, 100, -10, RoundingMode::RoundUp), 0);
+    }
+
+    #[test]
+    fn does_not_overflow_at_the_extremes() {
+        let half = u64::MAX / 2;
+        let down = interpolate_vested(half, u64::MAX, i128::MAX, RoundingMode::RoundDown);
+        let up = interpolate_vested(half, u64::MAX, i128::MAX, RoundingMode::RoundUp);
+        assert!(down > 0 && down <= i128::MAX / 2);
+        assert!(up == down || up == down + 1);
+        let near_end = interpolate_vested(u64::MAX - 1, u64::MAX, i128::MAX, RoundingMode::RoundUp);
+        assert!(near_end < i128::MAX);
+        assert_eq!(
+            interpolate_vested(u64::MAX, u64::MAX, i128::MAX, RoundingMode::RoundUp),
+            i128::MAX
+        );
+    }
+
+    #[test]
+    fn micro_schedule_withdrawals_sum_to_the_principal() {
+        // 7 units over 3 seconds, claimed every second: increments of the
+        // vested curve add back to the full deposit with no dust.
+        for mode in [RoundingMode::RoundDown, RoundingMode::RoundUp] {
+            let mut claimed = 0;
+            let mut previous = 0;
+            for t in 1..=3 {
+                let vested = interpolate_vested(t, 3, 7, mode);
+                assert!(vested >= previous);
+                claimed += vested - previous;
+                previous = vested;
+            }
+            assert_eq!(claimed, 7);
+        }
+    }
+
+    #[test]
+    fn round_down_never_exceeds_round_up() {
+        for elapsed in 0..=13 {
+            let down = interpolate_vested(elapsed, 13, 1_000_003, RoundingMode::RoundDown);
+            let up = interpolate_vested(elapsed, 13, 1_000_003, RoundingMode::RoundUp);
+            assert!(down <= up && up - down <= 1);
+        }
+    }
+}

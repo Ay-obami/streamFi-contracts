@@ -212,7 +212,11 @@ fn max_batch_size_reports_the_enforced_cap() {
 #[test]
 fn version_reports_the_current_behaviour_version() {
     let s = Setup::new();
+<<<<<<< HEAD
     // v5 raises the explicit cap to 50 and adds cancellation mode selection.
+=======
+    // v4 adds the allowance-funded batch entry point.
+>>>>>>> origin/main
     assert_eq!(s.client.version(), 5);
 }
 
@@ -1157,4 +1161,155 @@ fn test_fuzz_random_batch_amounts_boundary_100() {
             "fuzz batch {size} exceeded gas budget: {cpu}"
         );
     }
+}
+
+// ── Issues #888 & #889: batch_top_up_lenient & adaptive TTL bumping ─────────
+
+#[soroban_sdk::contract]
+pub struct MockTopUpStreamContract;
+
+#[soroban_sdk::contractimpl]
+impl MockTopUpStreamContract {
+    pub fn set_config(env: Env, expiration_ledger: u32, fail_code: u32) {
+        env.storage()
+            .instance()
+            .set(&soroban_sdk::symbol_short!("exp"), &expiration_ledger);
+        env.storage()
+            .instance()
+            .set(&soroban_sdk::symbol_short!("fail"), &fail_code);
+    }
+
+    pub fn expiration_ledger(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&soroban_sdk::symbol_short!("exp"))
+            .unwrap_or(0)
+    }
+
+    pub fn top_up(env: Env, _caller: Address, amount: i128) -> Result<(), Error> {
+        let fail_code: u32 = env
+            .storage()
+            .instance()
+            .get(&soroban_sdk::symbol_short!("fail"))
+            .unwrap_or(0);
+        if fail_code != 0 {
+            return Err(Error::InvalidAmount);
+        }
+        let prev: i128 = env
+            .storage()
+            .instance()
+            .get(&soroban_sdk::symbol_short!("bal"))
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&soroban_sdk::symbol_short!("bal"), &(prev + amount));
+        Ok(())
+    }
+
+    pub fn topped_up_total(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&soroban_sdk::symbol_short!("bal"))
+            .unwrap_or(0)
+    }
+}
+
+#[test]
+fn adaptive_ttl_uses_max_stream_expiration_and_clamps_bounds() {
+    let s = Setup::new();
+    let current = s.env.ledger().sequence();
+
+    // Register two mock streams: one short-lived, one long-lived (500_000 ledgers ahead).
+    let short_id = s.env.register_contract(None, MockTopUpStreamContract);
+    let long_id = s.env.register_contract(None, MockTopUpStreamContract);
+    MockTopUpStreamContractClient::new(&s.env, &short_id).set_config(&(current + 50_000), &0);
+    MockTopUpStreamContractClient::new(&s.env, &long_id).set_config(&(current + 500_000), &0);
+
+    let mut streams = Vec::new(&s.env);
+    streams.push_back(short_id);
+    streams.push_back(long_id);
+
+    let bump = s.client.bump_ttl_adaptive(&streams);
+    assert_eq!(bump, 500_000);
+
+    // Pure helper clamping check: past target falls back to default, huge target clamps to MAX_TTL_LEDGERS.
+    let mut past = Vec::new(&s.env);
+    past.push_back(current);
+    assert_eq!(
+        crate::ttl::compute_adaptive_bump_amount(current, &past),
+        drip_common::ttl::EXTEND_TTL_LEDGERS
+    );
+
+    let mut huge = Vec::new(&s.env);
+    huge.push_back(u32::MAX);
+    assert_eq!(
+        crate::ttl::compute_adaptive_bump_amount(0, &huge),
+        crate::ttl::MAX_TTL_LEDGERS
+    );
+}
+
+#[test]
+fn batch_top_up_lenient_isolates_failures_and_returns_per_item_status() {
+    let s = Setup::new();
+    let current = s.env.ledger().sequence();
+
+    let ok_stream_1 = s.env.register_contract(None, MockTopUpStreamContract);
+    let failing_stream = s.env.register_contract(None, MockTopUpStreamContract);
+    let ok_stream_2 = s.env.register_contract(None, MockTopUpStreamContract);
+
+    MockTopUpStreamContractClient::new(&s.env, &ok_stream_1).set_config(&(current + 300_000), &0);
+    MockTopUpStreamContractClient::new(&s.env, &failing_stream).set_config(&(current + 100_000), &1);
+    MockTopUpStreamContractClient::new(&s.env, &ok_stream_2).set_config(&(current + 250_000), &0);
+
+    let mut streams = Vec::new(&s.env);
+    streams.push_back(ok_stream_1.clone());
+    streams.push_back(failing_stream);
+    streams.push_back(ok_stream_2.clone());
+    streams.push_back(ok_stream_2.clone()); // 4th item has invalid amount (0)
+
+    let mut amounts = Vec::new(&s.env);
+    amounts.push_back(1_000);
+    amounts.push_back(2_000);
+    amounts.push_back(3_000);
+    amounts.push_back(0);
+
+    let results = s.client.batch_top_up_lenient(&s.funder, &streams, &amounts);
+    assert_eq!(results.len(), 4);
+
+    assert_eq!(
+        results.get(0).unwrap(),
+        crate::BatchResult {
+            item_index: 0,
+            success: true,
+            error_code: None,
+        }
+    );
+    assert!(!results.get(1).unwrap().success);
+    assert!(results.get(1).unwrap().error_code.is_some());
+    assert_eq!(
+        results.get(2).unwrap(),
+        crate::BatchResult {
+            item_index: 2,
+            success: true,
+            error_code: None,
+        }
+    );
+    assert_eq!(
+        results.get(3).unwrap(),
+        crate::BatchResult {
+            item_index: 3,
+            success: false,
+            error_code: Some(Error::InvalidAmount as u32),
+        }
+    );
+
+    // Valid streams received their top-ups despite failures in the same batch.
+    assert_eq!(
+        MockTopUpStreamContractClient::new(&s.env, &ok_stream_1).topped_up_total(),
+        1_000
+    );
+    assert_eq!(
+        MockTopUpStreamContractClient::new(&s.env, &ok_stream_2).topped_up_total(),
+        3_000
+    );
 }

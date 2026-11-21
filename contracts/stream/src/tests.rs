@@ -8,7 +8,7 @@ use std::boxed::Box;
 use soroban_sdk::{
     symbol_short,
     testutils::{storage::Instance as _, Address as _, Events as _, Ledger, LedgerInfo},
-    token, Address, Env, IntoVal, String, TryIntoVal,
+    token, Address, Env, IntoVal, String, Symbol, TryFromVal, TryIntoVal,
 };
 
 use crate::{
@@ -1425,20 +1425,21 @@ fn top_up_and_extend_updates_balance_and_end_time() {
     assert_eq!(contract_after, contract_before + 20_000);
 
     // The atomic operation emits one dedicated event rather than a generic
-    // top-up event plus a separate duration event that indexers must correlate.
-    assert_eq!(s.client.event_sequence(), 2);
+    // top-up event plus a separate duration event that indexers must correlate,
+    // followed by the explicit `StreamTopUpExtended` schedule event (#881).
+    assert_eq!(s.client.event_sequence(), 3);
     let all_events = s.env.events().all();
     let stream_events: std::vec::Vec<_> = all_events
         .iter()
         .filter(|(contract, _, _)| contract == &s.client.address)
         .collect();
-    assert_eq!(stream_events.len(), 2);
-    let last = stream_events.last().unwrap();
+    assert_eq!(stream_events.len(), 3);
+    let top_ext = &stream_events[1];
     assert_eq!(
-        last.1,
+        top_ext.1,
         (symbol_short!("top_ext"), s.sender.clone(), 2_u64).into_val(&s.env)
     );
-    let data: (i128, i128, u64, u64) = last.2.try_into_val(&s.env).unwrap();
+    let data: (i128, i128, u64, u64) = top_ext.2.try_into_val(&s.env).unwrap();
     assert_eq!(
         data,
         (
@@ -3585,6 +3586,7 @@ fn resume_emits_stream_resumed_event() {
     assert!(has_event_named(&s.env, "StreamResumed"));
 }
 
+
 #[test]
 fn rejected_double_pause_emits_no_stream_paused_event() {
     let s = Setup::new(100, 3_600, false);
@@ -3682,4 +3684,526 @@ fn rejected_resume_then_pause_retry_emits_events_once_each() {
     assert!(has_event_named(&s.env, "StreamPaused"));
     s.client.resume(&s.sender);
     assert!(has_event_named(&s.env, "StreamResumed"));
+}
+
+// ---- #887: custom TTL thresholds on emergency keeper renewal ----
+
+#[test]
+fn emergency_extend_ttl_custom_validates_bounds_and_extends() {
+    let s = Setup::new(100, 3_600, false);
+
+    // Zero min or extend rejected
+    assert_eq!(
+        s.client.try_emergency_extend_ttl_custom(&0, &100_000),
+        Err(Ok(Error::InvalidAmount))
+    );
+    assert_eq!(
+        s.client.try_emergency_extend_ttl_custom(&10_000, &0),
+        Err(Ok(Error::InvalidAmount))
+    );
+    // min > extend rejected
+    assert_eq!(
+        s.client.try_emergency_extend_ttl_custom(&200_000, &100_000),
+        Err(Ok(Error::InvalidAmount))
+    );
+    // extend > MAX_TTL_LEDGERS rejected
+    assert_eq!(
+        s.client
+            .try_emergency_extend_ttl_custom(&50_000, &(crate::ttl::MAX_TTL_LEDGERS + 1)),
+        Err(Ok(Error::InvalidAmount))
+    );
+
+    // Valid custom bounds (threshold above current 200_000 TTL) extend instance TTL to 350_000
+    assert_eq!(
+        s.client.try_emergency_extend_ttl_custom(&250_000, &350_000),
+        Ok(Ok(()))
+    );
+    let ttl = s
+        .env
+        .as_contract(&s.client.address, || s.env.storage().instance().get_ttl());
+    assert_eq!(ttl, 350_000);
+}
+
+// ---- #886: time-bounded emergency cancellation delegate ----
+
+#[test]
+fn cancel_delegate_allows_cancellation_within_window_only() {
+    let s = Setup::new(10, 3_600, false);
+    let delegate = Address::generate(&s.env);
+    let stranger = Address::generate(&s.env);
+    let now = s.env.ledger().timestamp();
+
+    // Non-sender cannot configure delegate
+    assert_eq!(
+        s.client
+            .try_set_cancel_delegate(&stranger, &delegate, &(now + 500)),
+        Err(Ok(Error::NotAuthorized))
+    );
+    // Expired timestamp rejected
+    assert_eq!(
+        s.client.try_set_cancel_delegate(&s.sender, &delegate, &now),
+        Err(Ok(Error::InvalidTimeRange))
+    );
+
+    // Sender configures delegate valid until now + 500
+    s.client
+        .set_cancel_delegate(&s.sender, &delegate, &(now + 500));
+    assert!(s.client.can_cancel_as_delegate(&delegate));
+    assert!(!s.client.can_cancel_as_delegate(&stranger));
+
+    // Cancel delegate CANNOT invoke other privileged sender actions (e.g. pause)
+    assert_eq!(
+        s.client.try_pause(&delegate),
+        Err(Ok(Error::NotAuthorized))
+    );
+
+    // Delegate CAN cancel while within window
+    s.client.cancel(&delegate);
+    assert!(s.client.info().is_cancelled());
+}
+
+#[test]
+fn expired_or_revoked_cancel_delegate_cannot_cancel() {
+    let s = Setup::new(10, 3_600, false);
+    let delegate = Address::generate(&s.env);
+    let now = s.env.ledger().timestamp();
+
+    s.client
+        .set_cancel_delegate(&s.sender, &delegate, &(now + 100));
+    assert!(s.client.can_cancel_as_delegate(&delegate));
+
+    // Advance past expiration -> delegate is no longer authorized
+    s.advance_secs(101);
+    assert!(!s.client.can_cancel_as_delegate(&delegate));
+    assert_eq!(
+        s.client.try_cancel(&delegate),
+        Err(Ok(Error::NotAuthorized))
+    );
+
+    // Re-grant and then explicitly revoke -> also rejected
+    let now2 = s.env.ledger().timestamp();
+    s.client
+        .set_cancel_delegate(&s.sender, &delegate, &(now2 + 500));
+    assert!(s.client.can_cancel_as_delegate(&delegate));
+    s.client.revoke_cancel_delegate(&s.sender);
+    assert!(!s.client.can_cancel_as_delegate(&delegate));
+    assert_eq!(
+        s.client.try_cancel(&delegate),
+        Err(Ok(Error::NotAuthorized))
+    );
+}
+
+// ── Issue #881: StreamTopUpExtended event ───────────────────────────────────
+
+fn stream_events(
+    s: &Setup,
+) -> std::vec::Vec<(soroban_sdk::Vec<soroban_sdk::Val>, soroban_sdk::Val)> {
+    s.env
+        .events()
+        .all()
+        .iter()
+        .filter(|(contract, _, _)| contract == &s.client.address)
+        .map(|(_, topics, data)| (topics, data))
+        .collect()
+}
+
+fn has_topic(s: &Setup, name: &str) -> bool {
+    let wanted = Symbol::new(&s.env, name);
+    stream_events(s).iter().any(|(topics, _)| {
+        topics
+            .get(0)
+            .and_then(|t| Symbol::try_from_val(&s.env, &t).ok())
+            .is_some_and(|t| t == wanted)
+    })
+}
+
+#[test]
+fn top_up_and_extend_emits_stream_top_up_extended() {
+    let s = Setup::new(100, 3_600, false);
+    let before_end = s.client.info().end_time;
+    let deposited_before = s.client.cumulative_deposited();
+    token::StellarAssetClient::new(&s.env, &s.token.address).mint(&s.sender, &20_000);
+
+    s.client.top_up_and_extend(&s.sender, &20_000, &200);
+
+    let (topics, data) = stream_events(&s).pop().unwrap();
+    assert_eq!(
+        topics,
+        (
+            Symbol::new(&s.env, "StreamTopUpExtended"),
+            s.sender.clone(),
+            3_u64
+        )
+            .into_val(&s.env)
+    );
+    let payload: (u64, u64, i128, i128) = data.try_into_val(&s.env).unwrap();
+    assert_eq!(
+        payload,
+        (
+            before_end,
+            before_end + 200,
+            20_000,
+            deposited_before + 20_000
+        )
+    );
+}
+
+#[test]
+fn plain_top_up_does_not_emit_stream_top_up_extended() {
+    let s = Setup::new(100, 3_600, false);
+    token::StellarAssetClient::new(&s.env, &s.token.address).mint(&s.sender, &5_000);
+
+    s.client.top_up(&s.sender, &5_000);
+
+    assert!(!has_topic(&s, "StreamTopUpExtended"));
+}
+
+// ── Issue #880: long-term stream TTL heartbeat ──────────────────────────────
+
+const YEAR_SECS: u64 = 31_536_000;
+
+fn instance_ttl(s: &Setup) -> u32 {
+    s.env
+        .as_contract(&s.client.address, || s.env.storage().instance().get_ttl())
+}
+
+#[test]
+fn heartbeat_extends_ttl_of_multi_year_stream() {
+    let s = Setup::new(1, 4 * YEAR_SECS, false);
+    s.env.ledger().with_mut(|l| l.sequence_number += 1_000_000);
+    let before = instance_ttl(&s);
+    assert!(before < 6_000_000);
+
+    s.client.bump_long_term_stream_ttl(&6_000_000, &6_000_000);
+
+    let after = instance_ttl(&s);
+    assert!(after > before);
+    assert!(after >= 6_000_000);
+}
+
+#[test]
+fn heartbeat_rejects_short_streams() {
+    let s = Setup::new(10, 3_600, false);
+    assert_eq!(
+        s.client.try_bump_long_term_stream_ttl(&1_000, &100_000),
+        Err(Ok(Error::StreamNotLongTerm))
+    );
+}
+
+#[test]
+fn heartbeat_rejects_ended_streams() {
+    let s = Setup::new(1, 2 * YEAR_SECS, false);
+    s.advance_secs(2 * YEAR_SECS);
+    assert_eq!(
+        s.client.try_bump_long_term_stream_ttl(&1_000, &100_000),
+        Err(Ok(Error::StreamNotLongTerm))
+    );
+}
+
+#[test]
+fn heartbeat_rejects_invalid_bounds() {
+    let s = Setup::new(1, 2 * YEAR_SECS, false);
+    for (threshold, bump) in [(0, 100), (100, 0), (200, 100), (1, 6_312_001)] {
+        assert_eq!(
+            s.client.try_bump_long_term_stream_ttl(&threshold, &bump),
+            Err(Ok(Error::InvalidAmount))
+        );
+    }
+}
+
+// ── Issue #878: delegated claims ────────────────────────────────────────────
+
+#[test]
+fn delegate_claims_for_recipient_without_taking_custody() {
+    let s = Setup::new(10, 3_600, false);
+    let delegate = Address::generate(&s.env);
+    s.client.set_claim_delegate(&delegate);
+    assert_eq!(s.client.claim_delegate(), Some(delegate.clone()));
+
+    s.advance_secs(100);
+    let claimed = s.client.claim_for(&delegate, &s.recipient, &500);
+
+    assert_eq!(claimed, 500);
+    assert_eq!(s.env.auths()[0].0, delegate);
+    assert_eq!(s.token.balance(&s.recipient), 500);
+    assert_eq!(s.token.balance(&delegate), 0);
+    assert_eq!(s.client.info().withdrawn, 500);
+    assert!(has_topic(&s, "claim_for"));
+}
+
+#[test]
+fn claim_for_requires_a_grant_from_the_recipient() {
+    let s = Setup::new(10, 3_600, false);
+    let delegate = Address::generate(&s.env);
+    s.advance_secs(100);
+
+    assert_eq!(
+        s.client.try_claim_for(&delegate, &s.recipient, &100),
+        Err(Ok(Error::NotAuthorized))
+    );
+}
+
+#[test]
+fn claim_for_rejects_a_recipient_that_does_not_match() {
+    let s = Setup::new(10, 3_600, false);
+    let delegate = Address::generate(&s.env);
+    let other = Address::generate(&s.env);
+    s.client.set_claim_delegate(&delegate);
+    s.advance_secs(100);
+
+    assert_eq!(
+        s.client.try_claim_for(&delegate, &other, &100),
+        Err(Ok(Error::NotAuthorized))
+    );
+}
+
+#[test]
+fn revoked_delegate_cannot_claim() {
+    let s = Setup::new(10, 3_600, false);
+    let delegate = Address::generate(&s.env);
+    s.client.set_claim_delegate(&delegate);
+    s.client.revoke_claim_delegate();
+    s.advance_secs(100);
+
+    assert_eq!(s.client.claim_delegate(), None);
+    assert_eq!(
+        s.client.try_claim_for(&delegate, &s.recipient, &100),
+        Err(Ok(Error::NotAuthorized))
+    );
+}
+
+#[test]
+fn claim_grant_does_not_carry_over_to_a_new_recipient() {
+    let s = Setup::new(10, 3_600, false);
+    let delegate = Address::generate(&s.env);
+    let new_recipient = Address::generate(&s.env);
+    s.client.set_claim_delegate(&delegate);
+    s.client.transfer_recipient(&new_recipient);
+    s.advance_secs(100);
+
+    assert_eq!(s.client.claim_delegate(), None);
+    assert_eq!(
+        s.client.try_claim_for(&delegate, &new_recipient, &100),
+        Err(Ok(Error::NotAuthorized))
+    );
+}
+
+#[test]
+fn recipient_cannot_be_its_own_claim_delegate() {
+    let s = Setup::new(10, 3_600, false);
+    assert_eq!(
+        s.client.try_set_claim_delegate(&s.recipient),
+        Err(Ok(Error::InvalidRecipient))
+    );
+
+// ---------------------------------------------------------------------------
+// Compact StreamFlags bitfield (#882)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn stream_flags_bitfield_getters_setters_and_persistent_roundtrip() {
+    use crate::storage::{get_status_flags, set_status_flags, StreamFlags};
+
+    let mut flags = StreamFlags::new();
+    assert_eq!(flags.bits(), 0);
+    assert!(!flags.is_paused());
+    assert!(!flags.is_cliff_claimed());
+    assert!(!flags.is_cancelled());
+    assert!(!flags.is_depleted());
+
+    flags.set_paused(true);
+    flags.set_cliff_claimed(true);
+    assert!(flags.is_paused());
+    assert!(flags.is_cliff_claimed());
+    assert!(!flags.is_cancelled());
+    assert!(!flags.is_depleted());
+
+    flags.set_cancelled(true);
+    flags.set_depleted(true);
+    flags.set_paused(false);
+    assert!(!flags.is_paused());
+    assert!(flags.is_cliff_claimed());
+    assert!(flags.is_cancelled());
+    assert!(flags.is_depleted());
+    assert_eq!(
+        flags.bits(),
+        StreamFlags::CLIFF_CLAIMED | StreamFlags::CANCELLED | StreamFlags::DEPLETED
+    );
+
+    let s = Setup::new(100, 3600, false);
+    s.env.as_contract(&s.client.address, || {
+        assert_eq!(get_status_flags(&s.env), StreamFlags::new());
+        set_status_flags(&s.env, flags);
+        assert_eq!(get_status_flags(&s.env), flags);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Non-linear vesting curves (#883)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn vesting_curve_linear_exponential_decay_and_stepped_invariants() {
+    use crate::state::{get_vesting_curve, set_vesting_curve, vested_amount_for_curve, VestingCurve};
+
+    let total: i128 = 1_000_000;
+    let duration: u64 = 1_000;
+
+    let lin_mid = vested_amount_for_curve(&VestingCurve::Linear, total, 500, duration).unwrap();
+    assert_eq!(lin_mid, 500_000);
+
+    // Exponential decay front-loads more value by the midpoint than linear vesting.
+    let exp_curve = VestingCurve::ExponentialDecay(5_000);
+    let exp_start = vested_amount_for_curve(&exp_curve, total, 0, duration).unwrap();
+    let exp_mid = vested_amount_for_curve(&exp_curve, total, 500, duration).unwrap();
+    let exp_end = vested_amount_for_curve(&exp_curve, total, duration, duration).unwrap();
+    assert_eq!(exp_start, 0);
+    assert!(exp_mid > lin_mid && exp_mid < total);
+    assert_eq!(exp_end, total);
+
+    // Stepped vesting unlocks in discrete 250-second chunks.
+    let stepped = VestingCurve::Stepped(250);
+    assert_eq!(vested_amount_for_curve(&stepped, total, 249, duration).unwrap(), 0);
+    assert_eq!(vested_amount_for_curve(&stepped, total, 250, duration).unwrap(), 250_000);
+    assert_eq!(vested_amount_for_curve(&stepped, total, 749, duration).unwrap(), 500_000);
+    assert_eq!(vested_amount_for_curve(&stepped, total, 750, duration).unwrap(), 750_000);
+    assert_eq!(vested_amount_for_curve(&stepped, total, duration, duration).unwrap(), total);
+
+    // Storage roundtrip defaults to Linear and persists configured curve.
+    let s = Setup::new(100, 3600, false);
+    s.env.as_contract(&s.client.address, || {
+        assert_eq!(get_vesting_curve(&s.env), VestingCurve::Linear);
+        set_vesting_curve(&s.env, &exp_curve);
+        assert_eq!(get_vesting_curve(&s.env), exp_curve);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Distinct InvalidCliffDuration error (#884)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn set_cliff_returns_invalid_cliff_duration_outside_stream_bounds() {
+    let s = Setup::new(100, 1_000, false);
+    let info = s.client.info();
+
+    // Cliff before start_time -> InvalidCliffDuration
+    assert_eq!(
+        s.client.try_set_cliff(&s.sender, &(info.start_time - 1), &100),
+        Err(Ok(Error::InvalidCliffDuration))
+    );
+
+    // Cliff after end_time -> InvalidCliffDuration
+    assert_eq!(
+        s.client.try_set_cliff(&s.sender, &(info.end_time + 1), &100),
+        Err(Ok(Error::InvalidCliffDuration))
+    );
+
+    // Cliff within [start_time, end_time] succeeds
+    assert!(s
+        .client
+        .try_set_cliff(&s.sender, &(info.start_time + 100), &100)
+        .is_ok());
+}
+
+// ---------------------------------------------------------------------------
+// Fuzz & property-based extreme duration edge cases (#885)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fuzz_extreme_stream_durations_and_arbitrary_tuples() {
+    use crate::state::{vested_amount_for_curve, VestingCurve};
+    use crate::storage::StreamInfo;
+
+    const ONE_SECOND: u64 = 1;
+    const HUNDRED_YEARS: u64 = 100 * 365 * 86_400;
+
+    let env = Env::default();
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    // 1. Explicit boundary duration cases: 1s, 100 years, and near u64::MAX
+    let boundary_cases: &[(u64, u64, i128)] = &[
+        (0, ONE_SECOND, 1),
+        (1_000, 1_000 + ONE_SECOND, 1_000_000_000_000),
+        (1_700_000_000, 1_700_000_000 + HUNDRED_YEARS, 10_000_000_000_000_000_000),
+        (u64::MAX - 10, u64::MAX, 500_000_000),
+        (u64::MAX - HUNDRED_YEARS, u64::MAX, i128::MAX / 4),
+    ];
+
+    let curves = [
+        VestingCurve::Linear,
+        VestingCurve::ExponentialDecay(2_500),
+        VestingCurve::ExponentialDecay(10_000),
+        VestingCurve::Stepped(1),
+        VestingCurve::Stepped(86_400),
+    ];
+
+    for &(start, stop, deposit) in boundary_cases {
+        let duration = stop.saturating_sub(start);
+        let info = StreamInfo {
+            sender: sender.clone(),
+            recipient: recipient.clone(),
+            token: token.clone(),
+            rate_per_second: 1,
+            start_time: start,
+            end_time: stop,
+            withdrawn: 0,
+            paused_at: 0,
+            flags: 0,
+            event_sequence: 0,
+            cumulative_fees: 0,
+        };
+
+        assert_eq!(info.elapsed_seconds(start), 0);
+        assert_eq!(info.elapsed_seconds(stop), duration);
+        assert_eq!(info.elapsed_seconds(u64::MAX), duration);
+
+        for curve in &curves {
+            let v0 = vested_amount_for_curve(curve, deposit, 0, duration).unwrap();
+            let v_mid = vested_amount_for_curve(curve, deposit, duration / 2, duration).unwrap();
+            let v_end = vested_amount_for_curve(curve, deposit, duration, duration).unwrap();
+            let v_over = vested_amount_for_curve(curve, deposit, u64::MAX, duration).unwrap();
+            assert_eq!(v0, 0);
+            assert!(v_mid >= 0 && v_mid <= deposit);
+            assert_eq!(v_end, deposit);
+            assert_eq!(v_over, deposit);
+        }
+    }
+
+    // 2. Deterministic PRNG fuzz over 500 arbitrary (start, stop, cliff, deposit) tuples
+    let mut seed: u64 = 0x5EED_CAFE_BABE_1337;
+    let mut next_u64 = || -> u64 {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+
+    for _ in 0..500 {
+        let start = next_u64() % (u64::MAX - HUNDRED_YEARS - 1);
+        let duration = match next_u64() % 4 {
+            0 => ONE_SECOND,
+            1 => 1 + (next_u64() % 86_400),
+            2 => 1 + (next_u64() % HUNDRED_YEARS),
+            _ => (u64::MAX - start).max(1),
+        };
+        let stop = start.saturating_add(duration);
+        let effective_duration = stop.saturating_sub(start);
+        let cliff = start.saturating_add(next_u64() % effective_duration.saturating_add(1));
+        assert!(cliff >= start && cliff <= stop);
+
+        let deposit = ((next_u64() as i128) % 10_000_000_000_000).max(1);
+        let t1 = next_u64() % effective_duration.saturating_add(1);
+        let t2 = t1.saturating_add(next_u64() % (effective_duration - t1).saturating_add(1));
+
+        for curve in &curves {
+            let v1 = vested_amount_for_curve(curve, deposit, t1, effective_duration).unwrap();
+            let v2 = vested_amount_for_curve(curve, deposit, t2, effective_duration).unwrap();
+            assert!(v1 >= 0 && v1 <= deposit, "v1 out of bounds");
+            assert!(v2 >= 0 && v2 <= deposit, "v2 out of bounds");
+            assert!(v1 <= v2, "monotonicity violated for {curve:?}: v({t1})={v1} > v({t2})={v2}");
+        }
+    }
 }

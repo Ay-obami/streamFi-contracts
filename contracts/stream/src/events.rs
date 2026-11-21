@@ -192,6 +192,59 @@ pub fn topped_up_and_extended(
     );
 }
 
+/// Publish the schedule extension made by `top_up_and_extend` (#881), so
+/// indexers can tell a term prolongation apart from a plain principal top-up.
+pub fn top_up_extended(
+    env: &Env,
+    caller: &Address,
+    old_end_time: u64,
+    new_end_time: u64,
+    added_amount: i128,
+    new_total_deposit: i128,
+) {
+    assert_non_negative_amount(env, added_amount);
+    assert_non_negative_amount(env, new_total_deposit);
+
+    let sequence = next_sequence(env);
+    env.events().publish(
+        (
+            Symbol::new(env, "StreamTopUpExtended"),
+            caller.clone(),
+            sequence,
+        ),
+        (old_end_time, new_end_time, added_amount, new_total_deposit),
+    );
+}
+
+/// Recipient granted `delegate` the right to call `claim_for` (#878).
+pub fn claim_delegate_set(env: &Env, recipient: &Address, delegate: &Address) {
+    let sequence = next_sequence(env);
+    env.events().publish(
+        (symbol_short!("claim_dlg"), recipient.clone(), sequence),
+        delegate.clone(),
+    );
+}
+
+/// Recipient revoked its claim delegate (#878).
+pub fn claim_delegate_revoked(env: &Env, recipient: &Address) {
+    let sequence = next_sequence(env);
+    env.events().publish(
+        (symbol_short!("rm_cl_dlg"), recipient.clone(), sequence),
+        (),
+    );
+}
+
+/// A delegate claimed `amount` for `recipient` through `claim_for` (#878).
+pub fn claimed_for(env: &Env, delegate: &Address, recipient: &Address, amount: i128) {
+    assert_non_negative_amount(env, amount);
+
+    let sequence = next_sequence(env);
+    env.events().publish(
+        (symbol_short!("claim_for"), delegate.clone(), sequence),
+        (recipient.clone(), amount),
+    );
+}
+
 /// Publish a prospective stream-rate change.
 pub fn rate_changed(env: &Env, caller: &Address, old_rate: i128, new_rate: i128) {
     assert_non_negative_amount(env, old_rate);

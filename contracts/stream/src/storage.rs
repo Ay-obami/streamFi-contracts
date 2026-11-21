@@ -106,6 +106,31 @@ pub enum DataKey {
     CancelledRecord,
     /// Funder approved by the sender to call `top_up_by_funder` (#933).
     ApprovedFunder(Address),
+    /// Time-bounded emergency cancellation delegate configured by the sender (#886).
+    CancelDelegate,
+    /// Delegate the recipient allowed to claim on its behalf via `claim_for` (#878).
+    ClaimDelegate,
+}
+
+/// Claim delegate granted by a recipient (#878). The grant is tied to the
+/// recipient that made it, so it stops working if the recipient changes.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClaimDelegateConfig {
+    pub recipient: Address,
+    pub delegate: Address,
+    /// Compact bitfield storing boolean stream status flags (#882).
+    StatusFlags,
+    /// Optional non-linear vesting curve configuration (#883).
+    VestingCurve,
+}
+
+/// Emergency cancellation delegate with a time-bounded expiration timestamp (#886).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CancelDelegateConfig {
+    pub delegate: Address,
+    pub expires_at: u64,
 }
 
 /// Immutable stream configuration stored in instance storage for cheaper reads (Issue #702).
@@ -294,4 +319,92 @@ pub fn set_cancelled_record(env: &Env, record: &CancelledStreamRecord) {
 
 pub fn get_cancelled_record(env: &Env) -> Option<CancelledStreamRecord> {
     env.storage().persistent().get(&DataKey::CancelledRecord)
+}
+
+/// Compact 8-bit bitfield packing boolean stream status flags to minimize
+/// Soroban persistent storage footprint (#882).
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub struct StreamFlags(pub u8);
+
+impl StreamFlags {
+    pub const PAUSED: u8 = 1 << 0;
+    pub const CLIFF_CLAIMED: u8 = 1 << 1;
+    pub const CANCELLED: u8 = 1 << 2;
+    pub const DEPLETED: u8 = 1 << 3;
+
+    pub const fn new() -> Self {
+        Self(0)
+    }
+
+    pub const fn from_bits(bits: u8) -> Self {
+        Self(bits)
+    }
+
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    pub const fn is_paused(self) -> bool {
+        (self.0 & Self::PAUSED) != 0
+    }
+
+    pub fn set_paused(&mut self, value: bool) {
+        if value {
+            self.0 |= Self::PAUSED;
+        } else {
+            self.0 &= !Self::PAUSED;
+        }
+    }
+
+    pub const fn is_cliff_claimed(self) -> bool {
+        (self.0 & Self::CLIFF_CLAIMED) != 0
+    }
+
+    pub fn set_cliff_claimed(&mut self, value: bool) {
+        if value {
+            self.0 |= Self::CLIFF_CLAIMED;
+        } else {
+            self.0 &= !Self::CLIFF_CLAIMED;
+        }
+    }
+
+    pub const fn is_cancelled(self) -> bool {
+        (self.0 & Self::CANCELLED) != 0
+    }
+
+    pub fn set_cancelled(&mut self, value: bool) {
+        if value {
+            self.0 |= Self::CANCELLED;
+        } else {
+            self.0 &= !Self::CANCELLED;
+        }
+    }
+
+    pub const fn is_depleted(self) -> bool {
+        (self.0 & Self::DEPLETED) != 0
+    }
+
+    pub fn set_depleted(&mut self, value: bool) {
+        if value {
+            self.0 |= Self::DEPLETED;
+        } else {
+            self.0 &= !Self::DEPLETED;
+        }
+    }
+}
+
+pub fn set_status_flags(env: &Env, flags: StreamFlags) {
+    let key = DataKey::StatusFlags;
+    let raw: u32 = u32::from(flags.bits());
+    env.storage().persistent().set(&key, &raw);
+    drip_common::ttl::bump_persistent(env, &key);
+}
+
+pub fn get_status_flags(env: &Env) -> StreamFlags {
+    let raw: u32 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::StatusFlags)
+        .unwrap_or(0);
+    StreamFlags::from_bits(raw as u8)
 }

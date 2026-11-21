@@ -73,6 +73,75 @@ pub fn extend_stream_ttl(env: &soroban_sdk::Env) {
     }
 }
 
+/// Emergency keeper renewal with caller-specified TTL threshold and extend
+/// target, guarded by protocol sanity bounds (Issue #887).
+///
+/// # Bounds
+/// - `min_ledgers_to_live > 0`
+/// - `ledgers_to_extend > 0`
+/// - `min_ledgers_to_live <= ledgers_to_extend`
+/// - `ledgers_to_extend <= MAX_TTL_LEDGERS`
+pub fn emergency_extend_custom(
+    env: &soroban_sdk::Env,
+    min_ledgers_to_live: u32,
+    ledgers_to_extend: u32,
+) -> Result<(), crate::errors::Error> {
+    if min_ledgers_to_live == 0
+        || ledgers_to_extend == 0
+        || min_ledgers_to_live > ledgers_to_extend
+        || ledgers_to_extend > MAX_TTL_LEDGERS
+    {
+        return Err(crate::errors::Error::InvalidAmount);
+    }
+    env.storage()
+        .instance()
+        .extend_ttl(min_ledgers_to_live, ledgers_to_extend);
+    Ok(())
+}
+
+/// Total schedule length (one year) from which a stream counts as a
+/// multi-year vesting schedule for `bump_long_term_stream_ttl` (#880).
+pub const LONG_TERM_STREAM_MIN_SECS: u64 = 31_536_000;
+
+/// Keeper heartbeat for multi-year vesting streams (#880).
+///
+/// Long grants can go months without a withdrawal, letting the instance TTL
+/// run out. Any relayer may call this to extend the instance TTL with the
+/// given threshold and target, so participants never need an emergency
+/// restore before withdrawing.
+///
+/// Only an active (not cancelled, not yet ended) bounded stream whose
+/// schedule spans at least [`LONG_TERM_STREAM_MIN_SECS`] qualifies; others
+/// get `StreamNotLongTerm`. Bounds match `emergency_extend_custom`.
+pub fn bump_long_term_stream_ttl(
+    env: &soroban_sdk::Env,
+    threshold: u32,
+    bump_ledgers: u32,
+) -> Result<(), crate::errors::Error> {
+    use crate::errors::Error;
+
+    if threshold == 0
+        || bump_ledgers == 0
+        || threshold > bump_ledgers
+        || bump_ledgers > MAX_TTL_LEDGERS
+    {
+        return Err(Error::InvalidAmount);
+    }
+
+    let info = crate::state::try_load(env)?;
+    crate::state::assert_not_cancelled(&info)?;
+    let schedule_secs = info.end_time.saturating_sub(info.start_time);
+    if info.end_time == 0
+        || schedule_secs < LONG_TERM_STREAM_MIN_SECS
+        || env.ledger().timestamp() >= info.end_time
+    {
+        return Err(Error::StreamNotLongTerm);
+    }
+
+    env.storage().instance().extend_ttl(threshold, bump_ledgers);
+    Ok(())
+}
+
 /// Low-cost keeper maintenance function for stream instances.
 ///
 /// Extends the TTL of an active stream's instance storage when the remaining

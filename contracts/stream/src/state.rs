@@ -1,4 +1,4 @@
-use soroban_sdk::{panic_with_error, Env};
+use soroban_sdk::{contracttype, panic_with_error, Env};
 
 use crate::storage::{DataKey, StreamInfo};
 #[allow(unused_imports)]
@@ -122,4 +122,108 @@ pub fn with_guard<R>(env: &Env, f: impl FnOnce(&Env) -> Result<R, Error>) -> Res
     let result = f(env);
     unlock(env);
     result
+}
+
+/// Vesting trajectory topology for a stream (#883).
+#[contracttype]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum VestingCurve {
+    /// Uniform linear vesting over the stream duration.
+    #[default]
+    Linear,
+    /// Front-loaded concave decay curve parameterized by basis-points decay coefficient (`decay_bps`).
+    /// `0` reduces to linear vesting; larger values accelerate early vesting.
+    ExponentialDecay(u32),
+    /// Discrete step vesting unlocking in equal steps every `step_duration` seconds.
+    Stepped(u64),
+}
+
+pub fn set_vesting_curve(env: &Env, curve: &VestingCurve) {
+    env.storage().instance().set(&DataKey::VestingCurve, curve);
+}
+
+pub fn get_vesting_curve(env: &Env) -> VestingCurve {
+    env.storage()
+        .instance()
+        .get(&DataKey::VestingCurve)
+        .unwrap_or_default()
+}
+
+/// Overflow-safe `(a * b) / denom` for `u128` without intermediate overflow.
+fn mul_div_u128(a: u128, b: u128, denom: u128) -> u128 {
+    if denom == 0 || a == 0 || b == 0 {
+        return 0;
+    }
+    if let Some(prod) = a.checked_mul(b) {
+        return prod / denom;
+    }
+    let q = a / denom;
+    let r = a % denom;
+    let part1 = q.saturating_mul(b);
+    let part2 = r.checked_mul(b).map(|p| p / denom).unwrap_or_else(|| {
+        let q2 = b / denom;
+        let r2 = b % denom;
+        r.saturating_mul(q2)
+            .saturating_add(r.saturating_mul(r2) / denom)
+    });
+    part1.saturating_add(part2)
+}
+
+/// Computes vested amount for a stream under the given [`VestingCurve`] (#883).
+///
+/// Guarantees `0 <= vested <= total_amount`, monotonicity in `elapsed`, and
+/// overflow-free execution across extreme durations (`1` second up to `u64::MAX`).
+pub fn vested_amount_for_curve(
+    curve: &VestingCurve,
+    total_amount: i128,
+    elapsed: u64,
+    duration: u64,
+) -> Result<i128, Error> {
+    if total_amount < 0 {
+        return Err(Error::InvalidAmount);
+    }
+    if total_amount == 0 || elapsed == 0 {
+        return Ok(0);
+    }
+    if duration == 0 || elapsed >= duration {
+        return Ok(total_amount);
+    }
+
+    let total = total_amount as u128;
+    let el = elapsed as u128;
+    let dur = duration as u128;
+
+    let vested = match *curve {
+        VestingCurve::Linear => mul_div_u128(total, el, dur),
+        VestingCurve::Stepped(step_duration) => {
+            if step_duration == 0 {
+                mul_div_u128(total, el, dur)
+            } else {
+                let total_steps = duration / step_duration;
+                if total_steps == 0 {
+                    0
+                } else {
+                    let completed_steps = (elapsed / step_duration).min(total_steps);
+                    mul_div_u128(total, completed_steps as u128, total_steps as u128)
+                }
+            }
+        }
+        VestingCurve::ExponentialDecay(decay_bps) => {
+            if decay_bps == 0 {
+                mul_div_u128(total, el, dur)
+            } else {
+                const SCALE: u128 = 1_000_000;
+                let x_ppm = mul_div_u128(el, SCALE, dur);
+                let k = (decay_bps as u128).min(100_000) * 100;
+                let num = (SCALE + k).saturating_mul(x_ppm);
+                let den = SCALE
+                    .saturating_mul(SCALE)
+                    .saturating_add(k.saturating_mul(x_ppm));
+                let ratio_ppm = mul_div_u128(num, SCALE, den).min(SCALE);
+                mul_div_u128(total, ratio_ppm, SCALE)
+            }
+        }
+    };
+
+    Ok(vested.min(total) as i128)
 }

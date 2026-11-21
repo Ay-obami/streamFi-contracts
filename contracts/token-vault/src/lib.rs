@@ -14,15 +14,16 @@ use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, 
 use storage::{
     check_vault_balance, get_depositor_token_balance, get_emergency_migration, get_max_limit,
     get_operator, get_operator_withdraw_limit, get_owner, get_owner_proposal_ttl,
-    get_pending_owner, get_pending_owner_proposed_at, get_pending_owner_proposer, get_token,
-    get_token_account_balance, get_token_max_limit, get_token_min_deposit, is_paused,
-    is_token_approved, record_vault_balance, remove_emergency_migration, remove_operator,
-    remove_pending_owner, remove_pending_owner_proposed_at, remove_pending_owner_proposer,
-    set_depositor_token_balance, set_emergency_migration, set_max_limit, set_operator,
-    set_operator_withdraw_limit, set_owner, set_owner_proposal_ttl as store_owner_proposal_ttl,
-    set_paused, set_pending_owner, set_pending_owner_proposed_at, set_pending_owner_proposer,
-    set_token, set_token_account_balance, set_token_approved, set_token_max_limit,
-    set_token_min_deposit, DataKey, EmergencyMigration,
+    get_pending_owner, get_pending_owner_proposed_at, get_pending_owner_proposer,
+    get_strategy_swept, get_token, get_token_account_balance, get_token_max_limit,
+    get_token_min_deposit, is_paused, is_strategy_approved, is_token_approved,
+    record_vault_balance, remove_emergency_migration, remove_operator, remove_pending_owner,
+    remove_pending_owner_proposed_at, remove_pending_owner_proposer, set_depositor_token_balance,
+    set_emergency_migration, set_max_limit, set_operator, set_operator_withdraw_limit, set_owner,
+    set_owner_proposal_ttl as store_owner_proposal_ttl, set_paused, set_pending_owner,
+    set_pending_owner_proposed_at, set_pending_owner_proposer, set_strategy_approved,
+    set_strategy_swept, set_token, set_token_account_balance, set_token_approved,
+    set_token_max_limit, set_token_min_deposit, DataKey, EmergencyMigration,
 };
 use ttl::bump_instance;
 
@@ -1420,6 +1421,97 @@ impl TokenVault {
     /// Read-only: alias for emergency_migration (Issue #679).
     pub fn get_emergency_migration(env: Env) -> Option<EmergencyMigration> {
         get_emergency_migration(&env)
+    }
+
+    // ── Yield strategy sweeping (Issue #893) ─────────────────────────────
+
+    /// Governance-maintained allowlist of third-party strategy vaults (AMM or
+    /// lending positions) that idle tokens may be swept into. Only the owner,
+    /// which is expected to be the `DripGovernor` contract so that every
+    /// change passes its proposal/consensus flow, may approve or revoke one.
+    pub fn approve_strategy(
+        env: Env,
+        caller: Address,
+        strategy: Address,
+        approved: bool,
+    ) -> Result<(), Error> {
+        let owner = get_owner(&env).ok_or(Error::NotInitialized)?;
+        if caller != owner {
+            return Err(Error::NotAuthorized);
+        }
+        caller.require_auth();
+        if approved
+            && (is_zero_address(&env, &strategy) || strategy == env.current_contract_address())
+        {
+            return Err(Error::InvalidParam);
+        }
+        set_strategy_approved(&env, &strategy, approved);
+        bump_instance(&env);
+        events::strategy_approval_changed(&env, &strategy, approved);
+        Ok(())
+    }
+
+    /// Sweeps `amount` of idle `token` from the vault into an approved
+    /// `strategy_vault` so locked capital can earn yield (Issue #893).
+    ///
+    /// Permissioned: `caller` must be the owner (the governor, so the sweep
+    /// itself needs governance consensus), the vault must not be paused, the
+    /// token must be on the vault's token allowlist and the strategy on the
+    /// strategy allowlist, and the vault must actually hold `amount`. The
+    /// running total per (token, strategy) is recorded for accounting.
+    ///
+    /// Returns the new running total swept into that strategy for `token`.
+    pub fn sweep_to_strategy(
+        env: Env,
+        caller: Address,
+        token: Address,
+        strategy_vault: Address,
+        amount: i128,
+    ) -> Result<i128, Error> {
+        non_reentrant!(&env, {
+            assert_not_paused(&env)?;
+            let owner = get_owner(&env).ok_or(Error::NotInitialized)?;
+            if caller != owner {
+                return Err(Error::NotAuthorized);
+            }
+            caller.require_auth();
+
+            if amount <= 0 {
+                return Err(Error::InvalidAmount);
+            }
+            if !is_token_approved(&env, &token) {
+                return Err(Error::TokenNotApproved);
+            }
+            if !is_strategy_approved(&env, &strategy_vault) {
+                return Err(Error::StrategyNotApproved);
+            }
+
+            let vault = env.current_contract_address();
+            let tk = token::Client::new(&env, &token);
+            if tk.balance(&vault) < amount {
+                return Err(Error::InsufficientVaultLiquidity);
+            }
+
+            let total = get_strategy_swept(&env, &token, &strategy_vault)
+                .checked_add(amount)
+                .ok_or(Error::ArithmeticOverflow)?;
+
+            tk.transfer(&vault, &strategy_vault, &amount);
+            set_strategy_swept(&env, &token, &strategy_vault, total);
+            bump_instance(&env);
+            events::swept_to_strategy(&env, &caller, &token, &strategy_vault, amount);
+            Ok(total)
+        })
+    }
+
+    /// Read-only: whether governance approved `strategy` as a sweep target.
+    pub fn is_strategy_approved(env: Env, strategy: Address) -> bool {
+        is_strategy_approved(&env, &strategy)
+    }
+
+    /// Read-only: running total of `token` swept into `strategy`.
+    pub fn strategy_swept(env: Env, token: Address, strategy: Address) -> i128 {
+        get_strategy_swept(&env, &token, &strategy)
     }
 
     /// Read-only: the emergency migration timelock duration in seconds (Issue #679).
