@@ -291,6 +291,28 @@ pub fn remove_emergency_migration(env: &Env) {
         .remove(&DataKey::EmergencyMigration);
 }
 
+/// Returns `true` while the transient reentrancy guard is held.
+pub fn is_reentrancy_locked(env: &Env) -> bool {
+    env.storage()
+        .temporary()
+        .get::<_, bool>(&DataKey::ReentrancyLock)
+        .unwrap_or(false)
+}
+
+/// Acquires the transient reentrancy guard in temporary storage.
+pub fn set_reentrancy_lock(env: &Env) {
+    env.storage()
+        .temporary()
+        .set(&DataKey::ReentrancyLock, &true);
+}
+
+/// Releases the transient reentrancy guard from temporary storage.
+pub fn remove_reentrancy_lock(env: &Env) {
+    env.storage()
+        .temporary()
+        .remove(&DataKey::ReentrancyLock);
+}
+
 /// Explicit owner approval is required before accepting a multi-token deposit.
 pub fn is_token_approved(env: &Env, token: &Address) -> bool {
     env.storage()

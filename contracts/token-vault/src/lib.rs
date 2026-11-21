@@ -71,21 +71,12 @@ pub const MAX_STREAM_BATCH_WITHDRAWALS: u32 = 10;
 #[macro_export]
 macro_rules! non_reentrant {
     ($env:expr, $body:block) => {{
-        if $env
-            .storage()
-            .temporary()
-            .get::<_, bool>(&$crate::storage::DataKey::ReentrancyLock)
-            .unwrap_or(false)
-        {
+        if $crate::storage::is_reentrancy_locked(&$env) {
             return Err($crate::errors::Error::ReentrancyDetected);
         }
-        $env.storage()
-            .temporary()
-            .set(&$crate::storage::DataKey::ReentrancyLock, &true);
+        $crate::storage::set_reentrancy_lock(&$env);
         let result = (|| -> Result<_, $crate::errors::Error> { $body })();
-        $env.storage()
-            .temporary()
-            .remove(&$crate::storage::DataKey::ReentrancyLock);
+        $crate::storage::remove_reentrancy_lock(&$env);
         result
     }};
 }
