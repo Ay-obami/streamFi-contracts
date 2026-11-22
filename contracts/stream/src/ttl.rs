@@ -190,6 +190,48 @@ pub fn bump_stream_instance(
     Ok(())
 }
 
+/// Verifies that an active stream's persistent storage TTL is above the protocol minimum.
+///
+/// For long-running streams spanning multiple months, this ensures that critical
+/// persistent data entries (MetadataUri, CancelledRecord) maintain their TTL above
+/// the protocol threshold to prevent state expiration during extended periods of
+/// recipient inactivity.
+///
+/// # Arguments
+/// - `env` — Soroban environment
+/// - `threshold_ledgers` — Minimum acceptable remaining TTL in ledgers
+///
+/// # Returns
+/// - `Ok(())` if all persistent entries meet or exceed the threshold
+/// - `Err(Error::DataExpired)` if any persistent entry falls below threshold
+///
+/// # Note
+/// This helper should be called after stream interactions to verify that
+/// `extend_stream_ttl` or similar bumps have properly renewed persistent storage.
+pub fn verify_persistent_ttl_above_threshold(
+    env: &soroban_sdk::Env,
+    threshold_ledgers: u32,
+) -> Result<(), crate::errors::Error> {
+    use crate::storage::DataKey;
+
+    let keys_to_check = [
+        DataKey::MetadataUri,
+        DataKey::CancelledRecord,
+    ];
+
+    for key in &keys_to_check {
+        if env.storage().persistent().has(key) {
+            let remaining_ttl = env.storage().persistent().get_ttl(key)
+                .ok_or(crate::errors::Error::DataExpired)?;
+            if remaining_ttl < threshold_ledgers {
+                return Err(crate::errors::Error::DataExpired);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod duration_ttl_tests {
     use super::*;
