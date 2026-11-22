@@ -16,7 +16,8 @@ pub fn compute_salt(env: &Env, stream_id: u64) -> BytesN<32> {
         .into()
 }
 
-/// Derives a deterministic deployment salt from sender, recipient, nonce, and token (Issue #764).
+/// Derives a deterministic deployment salt from sender, recipient, nonce, token, ledger sequence, and timestamp (Issue #764).
+/// Incorporates ledger sequence and timestamp to prevent front-running and address collision.
 pub fn derive_salt(
     env: &Env,
     sender: &Address,
@@ -29,6 +30,15 @@ pub fn derive_salt(
     payload.append(&recipient.to_xdr(env));
     payload.append(&soroban_sdk::Bytes::from_array(env, &nonce.to_be_bytes()));
     payload.append(&token.to_xdr(env));
+    
+    // Append ledger sequence (u32 as 4 BE bytes) and timestamp (u64 as 8 BE bytes)
+    // to prevent pre-computation of the salt address before transaction inclusion.
+    let sequence = env.ledger().sequence();
+    payload.append(&soroban_sdk::Bytes::from_array(env, &sequence.to_be_bytes()));
+    
+    let timestamp = env.ledger().timestamp();
+    payload.append(&soroban_sdk::Bytes::from_array(env, &timestamp.to_be_bytes()));
+    
     env.crypto().sha256(&payload).into()
 }
 
