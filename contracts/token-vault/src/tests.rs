@@ -2062,3 +2062,95 @@ fn token_vault_balance_reports_holdings_per_token() {
         s.token.balance(&s.client.address)
     );
 }
+
+
+// ── Vault balance reconciliation under concurrent operations ────────────────
+
+#[test]
+fn vault_balance_reconciliation_concurrent_deposit_and_pause() {
+    let s = Setup::new(1_000_000);
+
+    // Perform a valid deposit before pause
+    s.client.deposit(&s.owner, &100);
+    assert_eq!(s.client.balance(), Some(100));
+    assert_eq!(s.token.balance(&s.client.address), 100);
+
+    // Record ledger balance before pause
+    let balance_before_pause = s.token.balance(&s.client.address);
+    let vault_ledger_before = s.client.balance();
+
+    // Trigger emergency pause
+    s.client.pause(&s.owner);
+    assert!(s.client.is_paused());
+
+    // Attempt deposit after pause — must fail and not modify state
+    let result = s.client.try_deposit(&s.owner, &200);
+
+    // Deposit attempt must reject due to pause
+    assert_eq!(result, Err(Ok(Error::ContractPaused)));
+
+    // Verify ledger consistency: vault balance unchanged
+    assert_eq!(s.client.balance(), vault_ledger_before);
+    assert_eq!(s.client.balance(), Some(100));
+
+    // Verify token contract reserves unchanged
+    assert_eq!(s.token.balance(&s.client.address), balance_before_pause);
+    assert_eq!(s.token.balance(&s.client.address), 100);
+
+    // Unpause and verify operations resume normally
+    s.client.unpause(&s.owner);
+    assert!(!s.client.is_paused());
+
+    // After unpause, deposits should succeed and balance reconcile
+    s.client.deposit(&s.owner, &300);
+    assert_eq!(s.client.balance(), Some(400));
+    assert_eq!(s.token.balance(&s.client.address), 400);
+
+    // Simulate concurrent deposit attempts by depositing more
+    s.client.deposit(&s.owner, &50);
+    assert_eq!(s.client.balance(), Some(450));
+    assert_eq!(s.token.balance(&s.client.address), 450);
+
+    // Final reconciliation: ledger equals token contract reserves
+    assert_eq!(s.client.balance(), Some(450));
+    assert_eq!(s.token.balance(&s.client.address), 450);
+}
+
+#[test]
+fn vault_balance_reconciliation_emergency_drain_consistency() {
+    let s = Setup::new(1_000_000);
+    let recipient = Address::generate(&s.env);
+
+    // Build initial vault balance with multiple deposits
+    s.client.deposit(&s.owner, &400);
+    assert_eq!(s.client.balance(), Some(400));
+    assert_eq!(s.token.balance(&s.client.address), 400);
+
+    let initial_balance = s.client.balance();
+
+    // Perform emergency pause (simulates emergency drain scenario)
+    s.client.pause(&s.owner);
+
+    // Verify balance is frozen during pause
+    assert_eq!(s.client.balance(), initial_balance);
+    assert_eq!(s.token.balance(&s.client.address), 400);
+
+    // Attempt to withdraw during pause — must fail and preserve state
+    let withdraw_result = s.client.try_withdraw(&s.owner, &recipient, &100);
+    assert_eq!(withdraw_result, Err(Ok(Error::ContractPaused)));
+
+    // Ledger must remain consistent: no partial drain
+    assert_eq!(s.client.balance(), initial_balance);
+    assert_eq!(s.client.balance(), Some(400));
+    assert_eq!(s.token.balance(&s.client.address), 400);
+    assert_eq!(s.token.balance(&recipient), 0);
+
+    // Unpause and perform controlled withdrawal to verify post-pause integrity
+    s.client.unpause(&s.owner);
+    s.client.withdraw(&s.owner, &recipient, &100);
+
+    // Verify consistent state after withdrawal: ledger matches token reserves
+    assert_eq!(s.client.balance(), Some(300));
+    assert_eq!(s.token.balance(&s.client.address), 300);
+    assert_eq!(s.token.balance(&recipient), 100);
+}

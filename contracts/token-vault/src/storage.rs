@@ -393,6 +393,7 @@ pub fn tracked_liability_for_token(env: &Env, token: &Address) -> i128 {
         }
     }
     total
+}
 
 pub fn is_strategy_approved(env: &Env, strategy: &Address) -> bool {
     env.storage()
