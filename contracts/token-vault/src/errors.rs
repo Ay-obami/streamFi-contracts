@@ -8,8 +8,9 @@ pub enum Error {
     ArithmeticOverflow = 2,
     LimitExceeded = 3,
     NotAuthorized = 4,
-    /// `deposit`, `withdraw`, or `set_limit` was called while the vault is
-    /// under an emergency pause.
+    /// Legacy pause error retained for ABI compatibility. Vault pause gates now
+    /// return [`Error::VaultPaused`] so a halted vault is not reported as a
+    /// balance shortfall (Issue #896).
     ContractPaused = 5,
     /// `pause` was called while the vault was already paused.
     AlreadyPaused = 6,
@@ -49,8 +50,12 @@ pub enum Error {
     StreamCallFailed = 23,
     /// Target token has not been approved for vault deposits (Issue #815).
     TokenNotApprovedForVault = 24,
-    /// Target token has not been approved (alias for Issue #815).
-    TokenNotApproved = 25,
+    /// The vault is under an emergency pause (Issue #896).
+    ///
+    /// Returned by every state-modifying entrypoint while paused, so frontends
+    /// can tell users their funds are temporarily inaccessible rather than
+    /// lost. Distinct from the balance/liquidity errors below.
+    VaultPaused = 25,
     /// Vault balance changed unexpectedly within the same ledger.
     VaultBalanceChanged = 26,
     /// Vault does not hold sufficient token liquidity for withdrawal (Issue #760).
