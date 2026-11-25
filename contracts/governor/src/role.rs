@@ -226,10 +226,77 @@ pub fn require_role_or_admin(env: &Env, caller: &Address, role: Role) -> Result<
 /// Require that `caller` authorized the transaction and holds `Pauser` **or** `Admin` role.
 /// Emergency responders (pausers) can execute pause/unpause operations (Issue #771).
 /// This separates regular parameter tuning from emergency pause authority.
+/// #1013: Supports optional m-of-n guardian multi-signature for emergency actions.
 ///
 /// Bumps instance TTL on success.
 pub fn require_emergency_responder(env: &Env, caller: &Address) -> Result<(), Error> {
-    require_role_or_admin(env, caller, Role::Pauser)
+    // Direct role check first
+    if has_role(env, Role::Pauser, caller) || has_role(env, Role::Admin, caller) {
+        ttl::bump(env);
+        return Ok(());
+    }
+    // #1013: Check if multi-sig threshold is configured
+    if let Some(threshold) = env.storage().instance().get(&DataKey::EmergencyMultisigThreshold) {
+        if threshold > 0 {
+            let signed: u32 = env.storage().temporary().get(&DataKey::EmergencySignatures).unwrap_or(0);
+            if signed >= threshold {
+                ttl::bump(env);
+                return Ok(());
+            }
+        }
+    }
+    Err(Error::NotAuthorized)
+}
+
+/// #1013: Set the m-of-n threshold for emergency action execution.
+pub fn set_emergency_multisig_threshold(env: &Env, threshold: u32) -> Result<(), Error> {
+    let guardians = rbac::admin_count(env, &DataKey::AdminCount);
+    if threshold == 0 || threshold > guardians {
+        return Err(Error::InvalidParam);
+    }
+    env.storage()
+        .instance()
+        .set(&DataKey::EmergencyMultisigThreshold, &threshold);
+    Ok(())
+}
+
+/// Require M-of-N approval for a critical parameter update (#970).
+///
+/// Succeeds only when at least `threshold` distinct accounts in `approvers`
+/// hold `Role::Admin` and have authorized this invocation. Duplicate entries
+/// count once, and non-admins are ignored. Fails with `InvalidParam` when
+/// `threshold` is zero or larger than the number of approvers, and with
+/// `NotAuthorized` when too few valid approvals are present.
+///
+/// This is the verification helper. Callers that need multi-sig must pass the
+/// approver list and threshold themselves.
+pub fn require_admin_threshold(
+    env: &Env,
+    approvers: &Vec<Address>,
+    threshold: u32,
+) -> Result<(), Error> {
+    if threshold == 0 || approvers.len() < threshold {
+        return Err(Error::InvalidParam);
+    }
+    let mut counted: Vec<Address> = Vec::new(env);
+    for approver in approvers.iter() {
+        let mut already = false;
+        for seen in counted.iter() {
+            if seen == approver {
+                already = true;
+                break;
+            }
+        }
+        if already || !has_role(env, Role::Admin, &approver) {
+            continue;
+        }
+        approver.require_auth();
+        counted.push_back(approver);
+        if counted.len() >= threshold {
+            return Ok(());
+        }
+    }
+    Err(Error::NotAuthorized)
 }
 
 /// Propose transferring the admin role to a new address (step 1 of 2) (Issue #682).

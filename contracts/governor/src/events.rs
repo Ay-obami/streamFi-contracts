@@ -208,6 +208,26 @@ pub fn proposal_cancelled_by_admin(
     );
 }
 
+/// Emitted when the timelock delay is changed (Issue #967).
+pub fn set_timelock_delay(env: &Env, caller: &Address, old_seconds: u64, new_seconds: u64) {
+    env.events().publish(
+        (symbol_short!("tlock"), caller.clone()),
+        (old_seconds, new_seconds),
+    );
+}
+
+/// Emitted when a `SecurityGuardian` emergency-cancels a queued proposal (Issue #968).
+pub fn proposal_emergency_cancelled(env: &Env, guardian: &Address, proposal_id: u64) {
+    env.events().publish(
+        (
+            Symbol::new(env, "EmergencyCancelled"),
+            guardian.clone(),
+            proposal_id,
+        ),
+        (),
+    );
+}
+
 pub fn set_min_quorum_bps(
     env: &Env,
     caller: &Address,

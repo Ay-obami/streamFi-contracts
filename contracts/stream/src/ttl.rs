@@ -55,7 +55,9 @@ pub const LEDGER_BUMP: u32 = drip_common::ttl::EXTEND_TTL_LEDGERS;
 
 /// Automatic instance TTL extension on withdraw and top_up (Issue #750).
 pub fn extend_on_activity(env: &soroban_sdk::Env) {
-    env.storage().instance().extend_ttl(LEDGER_THRESHOLD, LEDGER_BUMP);
+    env.storage()
+        .instance()
+        .extend_ttl(LEDGER_THRESHOLD, LEDGER_BUMP);
 }
 
 /// Emergency instance TTL extension by any sender, recipient, or third-party (Issue #805).
@@ -70,6 +72,16 @@ pub fn extend_stream_ttl(env: &soroban_sdk::Env) {
         bump_for_remaining(env, remaining);
     } else {
         bump(env);
+    }
+
+    // Keep persistent side records alive with the instance as well (#945).
+    for key in [
+        crate::storage::DataKey::MetadataUri,
+        crate::storage::DataKey::CancelledRecord,
+    ] {
+        if env.storage().persistent().has(&key) {
+            drip_common::ttl::bump_persistent(env, &key);
+        }
     }
 }
 
@@ -175,6 +187,48 @@ pub fn bump_stream_instance(
         0
     };
     bump_for_remaining(env, remaining);
+    Ok(())
+}
+
+/// Verifies that an active stream's persistent storage TTL is above the protocol minimum.
+///
+/// For long-running streams spanning multiple months, this ensures that critical
+/// persistent data entries (MetadataUri, CancelledRecord) maintain their TTL above
+/// the protocol threshold to prevent state expiration during extended periods of
+/// recipient inactivity.
+///
+/// # Arguments
+/// - `env` — Soroban environment
+/// - `threshold_ledgers` — Minimum acceptable remaining TTL in ledgers
+///
+/// # Returns
+/// - `Ok(())` if all persistent entries meet or exceed the threshold
+/// - `Err(Error::DataExpired)` if any persistent entry falls below threshold
+///
+/// # Note
+/// This helper should be called after stream interactions to verify that
+/// `extend_stream_ttl` or similar bumps have properly renewed persistent storage.
+pub fn verify_persistent_ttl_above_threshold(
+    env: &soroban_sdk::Env,
+    threshold_ledgers: u32,
+) -> Result<(), crate::errors::Error> {
+    use crate::storage::DataKey;
+
+    let keys_to_check = [
+        DataKey::MetadataUri,
+        DataKey::CancelledRecord,
+    ];
+
+    for key in &keys_to_check {
+        if env.storage().persistent().has(key) {
+            let remaining_ttl = env.storage().persistent().get_ttl(key)
+                .ok_or(crate::errors::Error::DataExpired)?;
+            if remaining_ttl < threshold_ledgers {
+                return Err(crate::errors::Error::DataExpired);
+            }
+        }
+    }
+
     Ok(())
 }
 

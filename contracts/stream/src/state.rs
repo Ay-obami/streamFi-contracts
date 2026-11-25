@@ -58,6 +58,91 @@ pub fn assert_not_cancelled(info: &StreamInfo) -> Result<(), Error> {
     }
 }
 
+/// Check if a stream is in a cancellable state (Issue #937).
+///
+/// Returns `true` if the stream can be cancelled:
+/// - Stream is not already cancelled
+/// - Stream has not been fully completed/withdrawn
+///
+/// The caller authorization (sender permissions, recipient restrictions) should be
+/// validated separately at the contract method level using stream config and address.
+pub fn is_cancellable(info: &StreamInfo) -> Result<bool, Error> {
+    // Stream cannot be cancelled if it's already in a terminal cancelled state
+    if info.is_cancelled() {
+        return Ok(false);
+    }
+
+    // Stream can be cancelled as long as it's not fully cancelled
+    // Other authorization checks (sender, recipient, etc.) are done at the method level
+    Ok(info.is_in_cancellable_state())
+}
+
+/// Validate stream state transition from Paused to Cancelled.
+///
+/// Ensures that when a paused stream transitions to cancelled, the state remains consistent
+/// and unvested remainder refund calculations are correct. This validates:
+/// - Stream is currently paused
+/// - Stream is not already cancelled
+/// - Refund calculations will not overflow
+/// - Cancelled state can be safely persisted
+///
+/// # Arguments
+/// - `info` — The current stream state
+/// - `current_time` — Current timestamp for calculating streamed amount
+/// - `balance` — Current contract balance for the stream token
+///
+/// # Returns
+/// - `Ok(())` if the transition is valid
+/// - `Err(Error::NotPaused)` if the stream is not paused
+/// - `Err(Error::StreamCancelled)` if the stream is already cancelled
+/// - `Err(Error::ArithmeticOverflow)` if refund calculation overflows
+pub fn validate_paused_to_cancelled_transition(
+    info: &StreamInfo,
+    current_time: u64,
+    balance: i128,
+) -> Result<(), Error> {
+    // Stream must be in paused state to transition to cancelled
+    if !info.is_paused() {
+        return Err(Error::NotPaused);
+    }
+
+    // Stream must not already be cancelled
+    if info.is_cancelled() {
+        return Err(Error::StreamCancelled);
+    }
+
+    // Verify refund calculation will not overflow.
+    // During cancellation:
+    // 1. Calculate streamed amount (what has been earned)
+    // 2. Calculate owed_to_recipient = max(0, streamed - withdrawn)
+    // 3. Calculate refund_to_sender = max(0, balance - owed_to_recipient)
+    // 4. Calculate total_withdrawn = withdrawn + owed_to_recipient (this must not overflow)
+
+    let streamed = if info.rate_per_second > 0 && info.end_time > current_time {
+        let elapsed = current_time.saturating_sub(info.start_time);
+        (info.rate_per_second as u128)
+            .saturating_mul(elapsed as u128)
+            .min(i128::MAX as u128) as i128
+    } else if info.end_time > 0 && current_time >= info.end_time {
+        // Stream has ended or is fully vested
+        let total_duration = info.end_time.saturating_sub(info.start_time);
+        (info.rate_per_second as u128)
+            .saturating_mul(total_duration as u128)
+            .min(i128::MAX as u128) as i128
+    } else {
+        0
+    };
+
+    let owed_to_recipient = (streamed - info.withdrawn).max(0).min(balance);
+
+    // Verify total_withdrawn calculation won't overflow
+    info.withdrawn
+        .checked_add(owed_to_recipient)
+        .ok_or(Error::ArithmeticOverflow)?;
+
+    Ok(())
+}
+
 /// Maximum allowed re-entrancy depth. Must never be > 1 in production —
 /// Soroban's execution model makes re-entrancy structurally impossible,
 /// so any depth > 0 signals a bug or an emerging cross-contract callback
