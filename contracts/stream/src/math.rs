@@ -3,6 +3,25 @@ use soroban_sdk::{Env, U256};
 use crate::errors::Error;
 use crate::storage::{CliffConfig, DataKey, RateCheckpoint, StreamInfo};
 
+/// Safely calculates `amount * numerator / denominator` with checked arithmetic
+/// to prevent overflow (Issue #939). Handles i128 inputs and results with proper
+/// error handling for arithmetic errors.
+pub fn safe_mul_div(amount: i128, numerator: i128, denominator: i128) -> Result<i128, Error> {
+    if denominator == 0 {
+        return Err(Error::ArithmeticOverflow);
+    }
+    if amount == 0 || numerator == 0 {
+        return Ok(0);
+    }
+    // Use checked_mul and checked_div to detect overflow
+    let intermediate = amount
+        .checked_mul(numerator)
+        .ok_or(Error::ArithmeticOverflow)?;
+    intermediate
+        .checked_div(denominator)
+        .ok_or(Error::ArithmeticOverflow)
+}
+
 /// Calculates `value * multiplier / divisor` without overflowing an i128
 /// intermediate. Inputs and the result are non-negative.
 pub fn mul_div(
@@ -195,6 +214,57 @@ pub fn withdrawable(env: &Env, info: &StreamInfo) -> Result<i128, Error> {
     let streamed = streamed_amount(env, info)?;
     let available = streamed.saturating_sub(info.withdrawn);
     Ok(available.max(0))
+}
+
+/// Calculates stepped vesting amount for monthly or other periodic milestone unlocks (Issue #940).
+///
+/// Tokens unlock in discrete steps at regular intervals rather than continuously.
+/// Each completed step unlocks an equal portion of the total amount.
+///
+/// # Arguments
+/// - `elapsed`: time elapsed since vesting start in seconds
+/// - `total_duration`: total vesting duration in seconds
+/// - `step_duration`: duration of each vesting step in seconds (e.g., 2_592_000 for ~30 days)
+/// - `total_amount`: total tokens to vest
+///
+/// # Returns
+/// Amount unlocked at the current milestone step, or error on overflow.
+///
+/// # Examples
+/// - 10,000 tokens vesting over 100 days with 10-day steps: each 10-day milestone unlocks 1,000 tokens.
+/// - At elapsed=15 days (1.5 steps), returns amount for 1 complete step: 1,000 tokens.
+#[allow(dead_code)]
+pub fn calculate_stepped_vesting(
+    elapsed: u64,
+    total_duration: u64,
+    step_duration: u64,
+    total_amount: i128,
+) -> Result<i128, Error> {
+    if step_duration == 0 || total_duration == 0 {
+        return Err(Error::InvalidTimeRange);
+    }
+    if total_amount < 0 {
+        return Err(Error::InvalidAmount);
+    }
+    if elapsed == 0 || total_amount == 0 {
+        return Ok(0);
+    }
+
+    // Calculate the number of completed steps
+    let completed_steps = elapsed / step_duration;
+    let total_steps = (total_duration + step_duration - 1) / step_duration; // Ceiling division
+
+    if completed_steps >= total_steps {
+        return Ok(total_amount);
+    }
+
+    // Amount per step = total_amount / total_steps
+    let amount_per_step = safe_mul_div(total_amount, 1, total_steps as i128)?;
+
+    // Total vested = amount_per_step * completed_steps
+    amount_per_step
+        .checked_mul(completed_steps as i128)
+        .ok_or(Error::ArithmeticOverflow)
 }
 
 #[cfg(test)]

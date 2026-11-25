@@ -24,10 +24,7 @@ pub use drip_common::ttl::{
 /// eventually covered across calls.
 pub const BATCH_LIMIT: u32 = 8;
 
-/// Renew the factory instance lifetime on every successful stream deployment (Issue #961).
-///
-/// Keeping this as a named helper makes the deployment invariant explicit and gives
-/// future deployment paths one shared place to maintain the factory keep-alive.
+/// Renew the factory instance lifetime on every successful stream deployment (#961).
 pub fn extend_factory_ttl(env: &Env) {
     bump_instance(env);
 }

@@ -100,6 +100,20 @@ pub const TTL_THRESHOLD: u32 = MIN_TTL_LEDGERS;
 /// Legacy alias for [`EXTEND_TTL_LEDGERS`].
 pub const TTL_EXTEND_TO: u32 = EXTEND_TTL_LEDGERS;
 
+/// Default instance storage TTL threshold (in ledgers) before extension occurs.
+///
+/// Equivalent to [`MIN_TTL_LEDGERS`]. Used for naming consistency across
+/// protocol contracts (stream, vault, batch-processor) to enforce uniform
+/// storage expiration policies.
+pub const DEFAULT_INSTANCE_THRESHOLD: u32 = MIN_TTL_LEDGERS;
+
+/// Default instance storage TTL bump target (in ledgers) when extended.
+///
+/// Equivalent to [`EXTEND_TTL_LEDGERS`]. Used for naming consistency across
+/// protocol contracts (stream, vault, batch-processor) to enforce uniform
+/// storage expiration policies.
+pub const DEFAULT_INSTANCE_BUMP: u32 = EXTEND_TTL_LEDGERS;
+
 /// Extends the contract's instance storage TTL to [`EXTEND_TTL_LEDGERS`] whenever
 /// the remaining TTL drops below [`MIN_TTL_LEDGERS`].
 ///
@@ -445,19 +459,12 @@ mod check_and_bump_ttl_tests {
     #[contractimpl]
     impl TtlProbeContract {}
 
-    /// Moves the test ledger forward until the instance has exactly `ttl`
-    /// ledgers remaining. Soroban TTL APIs can only extend lifetime, not shorten it,
-    /// so advancing the ledger is the valid way to construct a lower-TTL fixture.
+    /// Forces the instance TTL to exactly `ttl` ledgers from the current ledger.
+    /// `extend_ttl(u32::MAX, ttl)` always applies because the TTL is below u32::MAX.
     fn set_instance_ttl(env: &Env, contract: &Address, ttl: u32) {
-        let current = instance_ttl(env, contract);
-        if current > ttl {
-            env.ledger()
-                .with_mut(|li| li.sequence_number += current - ttl);
-        } else if current < ttl {
-            env.as_contract(contract, || {
-                env.storage().instance().extend_ttl(ttl, ttl);
-            });
-        }
+        env.as_contract(contract, || {
+            env.storage().instance().extend_ttl(u32::MAX, ttl);
+        });
     }
 
     fn instance_ttl(env: &Env, contract: &Address) -> u32 {

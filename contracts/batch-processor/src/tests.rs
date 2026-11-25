@@ -9,11 +9,11 @@ use soroban_sdk::{
     token, Address, Env, IntoVal, Symbol, TryFromVal, TryIntoVal, Vec,
 };
 
-use crate::{BatchTransferProcessorClient, Error};
+use crate::{BatchExecutionSummary, BatchTransferProcessorClient, Error};
 
 /// Mirrors `MAX_BATCH_SIZE` — the value `max_batch_size()` must expose and
-/// the cap `process_batch` enforces (raised to 50 by issue #964).
-const MAX_BATCH_SIZE: u32 = 50;
+/// the cap `process_batch` enforces (reduced to 30 per issue #677).
+const MAX_BATCH_SIZE: u32 = 30;
 
 struct Setup {
     env: Env,
@@ -145,11 +145,12 @@ fn process_batch_with_allowance_pulls_and_fans_out_using_the_approved_allowance(
     let recipients = s.recipients(3);
     let amounts = s.amounts(&[100, 200, 300]);
     let expiry = s.env.ledger().sequence() + 1_000;
-    s.token.approve(&s.funder, &s.client.address, &600, &expiry);
+    s.token
+        .approve(&s.funder, &s.client.address, &600, &expiry);
 
-    let total =
-        s.client
-            .process_batch_with_allowance(&s.funder, &s.token_addr, &recipients, &amounts);
+    let total = s
+        .client
+        .process_batch_with_allowance(&s.funder, &s.token_addr, &recipients, &amounts);
 
     assert_eq!(total, 600);
     assert_eq!(s.token.balance(&recipients.get(0).unwrap()), 100);
@@ -167,11 +168,15 @@ fn process_batch_with_allowance_rejects_insufficient_allowance_before_transfers(
     let recipients = s.recipients(2);
     let amounts = s.amounts(&[100, 200]);
     let expiry = s.env.ledger().sequence() + 1_000;
-    s.token.approve(&s.funder, &s.client.address, &299, &expiry);
+    s.token
+        .approve(&s.funder, &s.client.address, &299, &expiry);
 
-    let result =
-        s.client
-            .try_process_batch_with_allowance(&s.funder, &s.token_addr, &recipients, &amounts);
+    let result = s.client.try_process_batch_with_allowance(
+        &s.funder,
+        &s.token_addr,
+        &recipients,
+        &amounts,
+    );
 
     assert_eq!(result, Err(Ok(Error::InsufficientAllowance)));
     assert_eq!(s.token.balance(&s.funder), 1_000_000);
@@ -212,11 +217,7 @@ fn max_batch_size_reports_the_enforced_cap() {
 #[test]
 fn version_reports_the_current_behaviour_version() {
     let s = Setup::new();
-<<<<<<< HEAD
-    // v5 raises the explicit cap to 50 and adds cancellation mode selection.
-=======
     // v4 adds the allowance-funded batch entry point.
->>>>>>> origin/main
     assert_eq!(s.client.version(), 5);
 }
 
@@ -703,18 +704,18 @@ fn test_reentrancy_lock_blocks_concurrent_execution() {
 }
 
 #[test]
-fn test_max_batch_size_limit_is_fifty() {
+fn test_max_batch_size_limit_is_thirty() {
     let s = Setup::new();
-    assert_eq!(s.client.max_batch_size(), 50);
-    assert_eq!(crate::MAX_BATCH_LIMIT, 50);
-    assert_eq!(crate::MAX_BATCH_SIZE, 50);
+    assert_eq!(s.client.max_batch_size(), 30);
+    assert_eq!(crate::MAX_BATCH_LIMIT, 30);
+    assert_eq!(crate::MAX_BATCH_SIZE, 30);
 }
 
 // ── CPU / memory benchmark across batch sizes (issue #818) ──────────────────
 
-/// Batch sizes tracked by the benchmark. 60 is above `MAX_BATCH_SIZE`
-/// and is expected to be rejected up front, before any transfer.
-const BENCH_SIZES: [u32; 6] = [10, 20, 30, 40, 50, 60];
+/// Batch sizes tracked by the benchmark. 40 and 50 are above `MAX_BATCH_SIZE`
+/// and are expected to be rejected up front, before any transfer.
+const BENCH_SIZES: [u32; 5] = [10, 20, 30, 40, 50];
 
 /// Resource ceilings for `process_batch`, measured at the three accepted
 /// sizes (10: 1.85M, 20: 3.59M, 30: 5.45M CPU; 30: 0.80M memory) with ~25 %
@@ -840,82 +841,6 @@ fn batch_cancel_cancels_multiple_streams() {
     );
 }
 
-// ── Issues #963-#964: partial/atomic cancel mode and explicit cap ───────────
-
-#[soroban_sdk::contracttype]
-#[derive(Clone)]
-enum CancelMockKey {
-    Fail,
-}
-
-#[soroban_sdk::contract]
-pub struct CancelMockContract;
-
-#[soroban_sdk::contractimpl]
-impl CancelMockContract {
-    pub fn init(env: Env, fail: bool) {
-        env.storage().instance().set(&CancelMockKey::Fail, &fail);
-    }
-
-    pub fn cancel(env: Env, _caller: Address) -> Result<(), Error> {
-        if env
-            .storage()
-            .instance()
-            .get(&CancelMockKey::Fail)
-            .unwrap_or(false)
-        {
-            Err(Error::NotAuthorized)
-        } else {
-            Ok(())
-        }
-    }
-}
-
-#[test]
-fn batch_cancel_partial_reports_failure_and_continues() {
-    let s = Setup::new();
-    let caller = Address::generate(&s.env);
-
-    let ok = s.env.register_contract(None, CancelMockContract);
-    CancelMockContractClient::new(&s.env, &ok).init(&false);
-
-    let fail = s.env.register_contract(None, CancelMockContract);
-    CancelMockContractClient::new(&s.env, &fail).init(&true);
-
-    let ok_two = s.env.register_contract(None, CancelMockContract);
-    CancelMockContractClient::new(&s.env, &ok_two).init(&false);
-
-    let mut streams = Vec::new(&s.env);
-    streams.push_back(ok);
-    streams.push_back(fail);
-    streams.push_back(ok_two);
-
-    let results = s.client.batch_cancel_with_mode(&caller, &streams, &true);
-    assert_eq!(results.len(), 3);
-    assert!(results.get(0).unwrap().success);
-    assert!(!results.get(1).unwrap().success);
-    assert_eq!(
-        results.get(1).unwrap().error_code,
-        Some(Error::NotAuthorized as u32)
-    );
-    assert!(results.get(2).unwrap().success);
-}
-
-#[test]
-fn batch_cancel_mode_rejects_more_than_fifty_items() {
-    let s = Setup::new();
-    let caller = Address::generate(&s.env);
-    let mut streams = Vec::new(&s.env);
-    for _ in 0..51 {
-        streams.push_back(Address::generate(&s.env));
-    }
-    assert_eq!(
-        s.client
-            .try_batch_cancel_with_mode(&caller, &streams, &false),
-        Err(Ok(Error::BatchTooLarge))
-    );
-}
-
 // ── Issue #817: keeper incentive rebate check in batch processing TTL bump ──
 
 #[test]
@@ -928,8 +853,7 @@ fn keeper_maintenance_reserve_rebate() {
     let rebate_amount = 5_000_i128;
 
     // Configure maintenance reserve
-    s.client
-        .configure_maintenance_reserve(&admin, &s.token_addr, &rebate_amount);
+    s.client.configure_maintenance_reserve(&admin, &s.token_addr, &rebate_amount);
     let reserve = s.client.maintenance_reserve().unwrap();
     assert_eq!(reserve.rebate_amount, rebate_amount);
     assert_eq!(reserve.balance, 0);
@@ -982,7 +906,9 @@ fn test_batch_withdraw_lenient_success_and_failures() {
     amounts.push_back(100i128); // Success
     amounts.push_back(999i128); // Triggers Error::NotAuthorized (code 6)
 
-    let results = s.client.batch_withdraw_lenient(&stream_ids, &amounts);
+    let results = s
+        .client
+        .batch_withdraw_lenient(&stream_ids, &amounts);
 
     assert_eq!(results.len(), 2);
     let r0 = results.get(0).unwrap();
@@ -1005,7 +931,9 @@ fn test_batch_withdraw_lenient_empty_amounts_queries_withdrawable() {
     stream_ids.push_back(stream.clone());
 
     let empty_amounts = Vec::new(&s.env);
-    let results = s.client.batch_withdraw_lenient(&stream_ids, &empty_amounts);
+    let results = s
+        .client
+        .batch_withdraw_lenient(&stream_ids, &empty_amounts);
 
     assert_eq!(results.len(), 1);
     let r0 = results.get(0).unwrap();
@@ -1022,9 +950,7 @@ fn test_batch_withdraw_lenient_validation_guards() {
     let empty_streams = Vec::new(&s.env);
     let empty_amounts = Vec::new(&s.env);
     assert_eq!(
-        s.client
-            .batch_withdraw_lenient(&empty_streams, &empty_amounts)
-            .len(),
+        s.client.batch_withdraw_lenient(&empty_streams, &empty_amounts).len(),
         0
     );
 
@@ -1034,8 +960,7 @@ fn test_batch_withdraw_lenient_validation_guards() {
         oversized.push_back(Address::generate(&s.env));
     }
     assert_eq!(
-        s.client
-            .try_batch_withdraw_lenient(&oversized, &empty_amounts),
+        s.client.try_batch_withdraw_lenient(&oversized, &empty_amounts),
         Err(Ok(Error::BatchTooLarge))
     );
 
@@ -1051,6 +976,83 @@ fn test_batch_withdraw_lenient_validation_guards() {
     );
 }
 
+// ── Issue #965: batch execution summary event ───────────────────────────────
+
+#[test]
+fn batch_withdraw_lenient_emits_execution_summary_with_failure_indices() {
+    let s = Setup::new();
+    let stream_success = s.env.register_contract(None, MockStreamContract);
+    let stream_fail = s.env.register_contract(None, MockStreamContract);
+
+    let mut stream_ids = Vec::new(&s.env);
+    stream_ids.push_back(stream_success);
+    stream_ids.push_back(stream_fail);
+
+    // Index 1 fails inside the mock (amount 999 -> NotAuthorized).
+    let amounts = s.amounts(&[100, 999]);
+    s.client.batch_withdraw_lenient(&stream_ids, &amounts);
+
+    // The summary is published last, after the per-batch lenient event.
+    let events = s.processor_events();
+    let (_, _, data) = events.last().unwrap();
+    let summary = BatchExecutionSummary::try_from_val(&s.env, data).unwrap();
+    assert_eq!(summary.total, 2);
+    assert_eq!(summary.successful, 1);
+    assert_eq!(summary.failed_indices.len(), 1);
+    assert_eq!(summary.failed_indices.get(0).unwrap(), 1);
+}
+
+// ── Issue #966: strict batch rollback with a mixed valid/invalid recipient set ──
+
+#[test]
+fn process_batch_rolls_back_entirely_when_one_recipient_is_invalid() {
+    let s = Setup::new();
+    let valid_a = Address::generate(&s.env);
+    let invalid = Address::generate(&s.env);
+    let valid_b = Address::generate(&s.env);
+
+    let mut recipients = Vec::new(&s.env);
+    recipients.push_back(valid_a.clone());
+    recipients.push_back(invalid.clone());
+    recipients.push_back(valid_b.clone());
+
+    // The middle recipient carries an invalid (zero) amount, so the batch
+    // must fail as a whole in strict mode.
+    let amounts = s.amounts(&[100, 0, 300]);
+
+    let funder_before = s.token.balance(&s.funder);
+    let contract_before = s.token.balance(&s.client.address);
+
+    assert_eq!(
+        s.client
+            .try_process_batch(&s.funder, &s.token_addr, &recipients, &amounts),
+        Err(Ok(Error::InvalidAmount))
+    );
+
+    // No funds moved: funder untouched, no recipient paid, contract empty.
+    assert_eq!(s.token.balance(&s.funder), funder_before);
+    assert_eq!(s.token.balance(&valid_a), 0);
+    assert_eq!(s.token.balance(&invalid), 0);
+    assert_eq!(s.token.balance(&valid_b), 0);
+    assert_eq!(s.token.balance(&s.client.address), contract_before);
+
+    // No success event was published for the reverted batch.
+    assert!(s.processor_events().is_empty());
+
+    // The processor is still usable afterwards (no leftover reentrancy lock
+    // or partial state).
+    let mut ok_recipients = Vec::new(&s.env);
+    ok_recipients.push_back(valid_a.clone());
+    ok_recipients.push_back(valid_b.clone());
+    assert_eq!(
+        s.client
+            .process_batch(&s.funder, &s.token_addr, &ok_recipients, &s.amounts(&[100, 300])),
+        400
+    );
+    assert_eq!(s.token.balance(&valid_a), 100);
+    assert_eq!(s.token.balance(&valid_b), 300);
+}
+
 // ── Issue #762: TTL extension helpers ───────────────────────────────────────
 
 #[test]
@@ -1059,8 +1061,7 @@ fn test_bump_ttl_to_stream_expiration() {
     let current_ledger = s.env.ledger().sequence();
 
     // Call extension to future ledger
-    s.client
-        .bump_ttl_to_stream_expiration(&(current_ledger + 50_000));
+    s.client.bump_ttl_to_stream_expiration(&(current_ledger + 50_000));
 
     // Call automated helper
     s.client.bump_instance_and_keys();
@@ -1082,9 +1083,7 @@ fn test_fuzz_batch_size_boundaries_gas_and_limits() {
         // 1. process_batch at boundary size must be rejected cheaply with BatchTooLarge
         s.env.budget().reset_unlimited();
         s.env.budget().reset_tracker();
-        let res = s
-            .client
-            .try_process_batch(&s.funder, &s.token_addr, &recipients, &amounts);
+        let res = s.client.try_process_batch(&s.funder, &s.token_addr, &recipients, &amounts);
         assert_eq!(res, Err(Ok(Error::BatchTooLarge)));
         let cpu_process = s.env.budget().cpu_instruction_cost();
         let mem_process = s.env.budget().memory_bytes_cost();
@@ -1120,9 +1119,9 @@ fn test_fuzz_batch_size_boundaries_gas_and_limits() {
         assert_eq!(withdraw_res, Err(Ok(Error::BatchTooLarge)));
 
         // 5. process_batch_with_limit with 99, 100, 101 items and max_items=30 processes 30 and leaves remainder
-        let partial_res =
-            s.client
-                .process_batch_with_limit(&s.funder, &s.token_addr, &recipients, &amounts, &30);
+        let partial_res = s
+            .client
+            .process_batch_with_limit(&s.funder, &s.token_addr, &recipients, &amounts, &30);
         assert_eq!(partial_res.processed_count, 30);
         assert_eq!(partial_res.remaining_count, size - 30);
         assert_eq!(partial_res.requested_count, size);
@@ -1151,15 +1150,10 @@ fn test_fuzz_random_batch_amounts_boundary_100() {
 
         s.env.budget().reset_unlimited();
         s.env.budget().reset_tracker();
-        let res = s
-            .client
-            .try_process_batch(&s.funder, &s.token_addr, &recipients, &amounts);
+        let res = s.client.try_process_batch(&s.funder, &s.token_addr, &recipients, &amounts);
         assert_eq!(res, Err(Ok(Error::BatchTooLarge)));
         let cpu = s.env.budget().cpu_instruction_cost();
-        assert!(
-            cpu < 800_000,
-            "fuzz batch {size} exceeded gas budget: {cpu}"
-        );
+        assert!(cpu < 800_000, "fuzz batch {size} exceeded gas budget: {cpu}");
     }
 }
 
