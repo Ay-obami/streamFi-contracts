@@ -113,6 +113,47 @@ pub fn stream_created(
     );
 }
 
+/// Payload for `StreamContractDeployed` (Issue #958).
+#[soroban_sdk::contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StreamContractDeployedPayload {
+    pub stream_id: u64,
+    pub sender: Address,
+    pub recipient: Address,
+    pub contract_address: Address,
+    pub timestamp: u64,
+}
+
+/// Emitted once a stream contract is deployed and initialized by the factory
+/// (Issue #958). Lets indexers pick up new stream instances from events alone.
+///
+/// Topics: `("StreamContractDeployed", sender, recipient)`
+/// Data:   `StreamContractDeployedPayload { stream_id, sender, recipient,
+///          contract_address, timestamp }`
+pub fn stream_contract_deployed(
+    env: &Env,
+    stream_id: u64,
+    sender: &Address,
+    recipient: &Address,
+    contract_address: &Address,
+) {
+    let payload = StreamContractDeployedPayload {
+        stream_id,
+        sender: sender.clone(),
+        recipient: recipient.clone(),
+        contract_address: contract_address.clone(),
+        timestamp: env.ledger().timestamp(),
+    };
+    env.events().publish(
+        (
+            Symbol::new(env, "StreamContractDeployed"),
+            sender.clone(),
+            recipient.clone(),
+        ),
+        payload,
+    );
+}
+
 /// Emitted when the hash used for future stream deployments changes.
 pub fn stream_contract_upgraded(env: &Env, old_wasm_hash: &BytesN<32>, new_wasm_hash: &BytesN<32>) {
     env.events().publish(
@@ -135,4 +176,96 @@ pub fn fee_update_executed(env: &Env, old_fee_bps: u32, new_fee_bps: u32) {
         (Symbol::new(env, "fee_executed"),),
         (old_fee_bps, new_fee_bps),
     );
+}
+
+/// Emitted when a protocol fee collector update is proposed under timelock (Issue #905).
+pub fn fee_collector_update_proposed(env: &Env, proposed_collector: &Address, eta_ledger: u32) {
+    env.events().publish(
+        (Symbol::new(env, "fee_collector_proposed"),),
+        (proposed_collector.clone(), eta_ledger),
+    );
+}
+
+/// Emitted when a timelocked protocol fee collector update is executed (Issue #905).
+pub fn fee_collector_update_executed(env: &Env, old_collector: &Address, new_collector: &Address) {
+    env.events().publish(
+        (Symbol::new(env, "fee_collector_executed"),),
+        (old_collector.clone(), new_collector.clone()),
+    );
+}
+
+/// Deprecation notice for a stream WASM version superseded by a governance
+/// upgrade (Issue #902). Published once per superseded version, alongside
+/// `StreamContractUpgraded`.
+///
+/// Topics: `("WasmVersionDeprecated",)`
+/// Data:   `(version_number, wasm_hash, superseded_by_version)`
+pub fn wasm_version_deprecated(
+    env: &Env,
+    version_number: u32,
+    wasm_hash: &BytesN<32>,
+    superseded_by_version: u32,
+) {
+    env.events().publish(
+        (Symbol::new(env, "WasmVersionDeprecated"),),
+        (version_number, wasm_hash.clone(), superseded_by_version),
+    );
+}
+
+/// Emitted when an existing stream is migrated from one contract address to
+/// another (Issue #903). Gives indexers an unambiguous link between the old and
+/// new addresses and the migration time.
+///
+/// Topics: `("StreamMigrated",)`
+/// Data:   `(old_address, new_address, migration_timestamp)`
+///
+/// No migration entrypoint currently calls this. `upgrade_stream_wasm` changes
+/// only the hash used for future deployments and does not know any existing
+/// stream address, and `upgrade_self` replaces the factory's own code. Wire it
+/// in once a per-stream migration path exists.
+#[allow(dead_code)]
+pub fn stream_migrated(
+    env: &Env,
+    old_address: &Address,
+    new_address: &Address,
+    migration_timestamp: u64,
+) {
+    env.events().publish(
+        (Symbol::new(env, "StreamMigrated"),),
+        (old_address.clone(), new_address.clone(), migration_timestamp),
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::DripFactory;
+    use soroban_sdk::testutils::{Address as _, Events as _};
+
+    #[test]
+    fn stream_migrated_publishes_exactly_one_event() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, DripFactory);
+        let old_address = Address::generate(&env);
+        let new_address = Address::generate(&env);
+
+        env.as_contract(&contract_id, || {
+            stream_migrated(&env, &old_address, &new_address, 1_700_000_000);
+        });
+
+        assert_eq!(env.events().all().len(), 1);
+    }
+
+    #[test]
+    fn wasm_version_deprecated_publishes_exactly_one_event() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, DripFactory);
+        let hash = BytesN::from_array(&env, &[3u8; 32]);
+
+        env.as_contract(&contract_id, || {
+            wasm_version_deprecated(&env, 1, &hash, 2);
+        });
+
+        assert_eq!(env.events().all().len(), 1);
+    }
 }

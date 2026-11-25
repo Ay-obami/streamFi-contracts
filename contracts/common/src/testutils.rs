@@ -2,7 +2,7 @@
 //! Gated behind the `testutils` feature flag (Issue #709).
 
 use soroban_sdk::{
-    testutils::{Address as _, Ledger as _},
+    testutils::{Address as _, Ledger as _, MockAuth, MockAuthInvoke},
     Address, Env,
 };
 
@@ -45,10 +45,27 @@ pub fn create_mock_token(env: &Env, admin: &Address) -> Address {
         .address()
 }
 
+/// Mocks authorization for `address` for exactly one invocation context.
+///
+/// `setup_test_env` authorizes everything with `mock_all_auths`, which hides
+/// missing or wrong auth requirements. Use this when a test needs to assert
+/// that a specific `address` authorized a specific `invocation` (contract,
+/// function name, arguments and any sub-invocations) and nothing else: any call
+/// that does not match fails its authorization check.
+///
+/// `invocation` is the SDK's `MockAuthInvoke`; build `args` with
+/// `(&a, b).into_val(env)`.
+pub fn mock_auth_context(env: &Env, address: &Address, invocation: &MockAuthInvoke) {
+    env.mock_auths(&[MockAuth {
+        address,
+        invoke: invocation,
+    }]);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::token;
+    use soroban_sdk::{token, IntoVal};
 
     #[test]
     fn advance_time_and_ledgers_updates_both_clock_and_sequence() {
@@ -60,6 +77,31 @@ mod tests {
 
         assert_eq!(after.timestamp, before.timestamp + 120);
         assert_eq!(after.sequence_number, before.sequence_number + 24);
+    }
+
+    #[test]
+    fn mock_auth_context_authorizes_only_the_given_invocation() {
+        let env = Env::default();
+        let admin = create_test_address(&env);
+        let holder = create_test_address(&env);
+        let token_addr = create_mock_token(&env, &admin);
+        let asset = token::StellarAssetClient::new(&env, &token_addr);
+
+        mock_auth_context(
+            &env,
+            &admin,
+            &MockAuthInvoke {
+                contract: &token_addr,
+                fn_name: "mint",
+                args: (&holder, 100i128).into_val(&env),
+                sub_invokes: &[],
+            },
+        );
+        asset.mint(&holder, &100);
+        assert_eq!(token::Client::new(&env, &token_addr).balance(&holder), 100);
+
+        // A different invocation was never mocked, so it must not be authorized.
+        assert!(asset.try_mint(&holder, &50).is_err());
     }
 
     #[test]

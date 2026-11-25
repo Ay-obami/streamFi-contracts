@@ -321,6 +321,10 @@ pub enum DataKey {
     AccumulatedFee(Address),
     /// **Instance storage.** Granular pause level for creation vs emergency operations (Issue #767).
     PauseLevel,
+    /// **Instance storage.** Granular pause flags as `drip_common::pause::PauseFlags`
+    /// bits (Issue #975), written by `set_pause_flags`. Absent means no granular
+    /// flags are set. Layered on top of `PauseLevel`; see `pause::effective_flags`.
+    PauseFlags,
     /// **Instance storage.** Pending protocol fee update proposal under timelock (Issue #766).
     PendingFeeUpdate,
     /// **Instance storage.** Active protocol fee in basis points when set via timelocked execution (Issue #766).
@@ -330,4 +334,23 @@ pub enum DataKey {
     /// TTL bump on every read; falls back to the durable instance counter when
     /// the temporary entry has expired.
     StreamCountCache,
+    /// **Persistent storage.** Reverse-lookup index of the stream contracts deployed
+    /// for a token (Issue #900), for analytics such as "every stream distributing
+    /// this asset".
+    /// Key: `DataKey::StreamsByToken(Address)` — the token contract address
+    /// Value: `Vec<Address>` — deployed DripStream addresses in creation order
+    /// Serialization: XDR tagged union [discriminant: u32][token: XDR Address] → [stream_addresses: XDR Vec<Address>]
+    /// TTL: Extended to `ttl::EXTEND_TO` (200_000 ledgers) on each new stream
+    StreamsByToken(Address),
+    /// **Instance storage.** Append-only history of the stream WASM hashes set via
+    /// governance (Issue #902). Each entry records the version number, the hash, and
+    /// the ledger at which it became the deployment hash.
+    /// Key: `DataKey::WasmVersionHistory` (no inner type, discriminant only)
+    /// Value: `Vec<WasmVersionInfo>` — oldest first. The last entry always matches
+    /// `DataKey::StreamWasmHash`.
+    WasmVersionHistory,
+    /// **Instance storage.** Pending protocol fee collector update proposal under timelock (Issue #905).
+    PendingFeeCollectorUpdate,
+    /// **Instance storage.** Active protocol fee collector address set via timelocked execution (Issue #905).
+    FeeCollectorAddress,
 }

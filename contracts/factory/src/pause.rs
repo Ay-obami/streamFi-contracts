@@ -1,7 +1,22 @@
-//! Emergency-pause flag storage and gating for `DripFactory`.
+//! Emergency-pause state for `DripFactory`.
 //!
-//! Supports granular pause levels: `CreationOnly` and `FullEmergency` (Issue #767).
+//! Two layers, read together through [`effective_flags`]:
+//!
+//! - the **global level** ([`PauseType`], Issue #767), set by `pause`,
+//!   `unpause` and `pause_with_level`. Its footprint is fixed by
+//!   [`global_flags`];
+//! - the **granular flags** ([`PauseFlags`], Issue #975), an operator overlay
+//!   stored under `DataKey::PauseFlags` and written by `set_pause_flags`.
+//!
+//! The layers are OR-ed. A global pause keeps its footprint whatever the
+//! overlay holds, and clearing the overlay cannot lift it. Clearing the global
+//! level leaves any explicitly set granular flags in force.
+//!
+//! No storage migration is needed. A factory that predates this change has no
+//! `DataKey::PauseFlags` key and reads as zero granular flags, and its existing
+//! `PauseLevel` / `Paused` keys keep their meaning.
 
+use drip_common::pause::PauseFlags;
 use soroban_sdk::{contracttype, Env};
 
 use crate::errors::Error;
@@ -37,7 +52,8 @@ pub fn set_pause_level(env: &Env, level: PauseType) {
 
 /// Reads the emergency-pause flag.
 ///
-/// Defaults to `false` (unpaused) when the key has never been set.
+/// Defaults to `false` (unpaused) when the key has never been set. Reports the
+/// global level only: granular flags do not flip it.
 pub fn is_paused(env: &Env) -> bool {
     pause_level(env) != PauseType::Unpaused
 }
@@ -52,15 +68,59 @@ pub fn set_paused(env: &Env, paused: bool) {
     set_pause_level(env, level);
 }
 
-/// Rejects if stream creation is paused (either CreationOnly or FullEmergency).
-pub fn require_creation_allowed(env: &Env) -> Result<(), Error> {
-    match pause_level(env) {
-        PauseType::Unpaused => Ok(()),
-        PauseType::CreationOnly | PauseType::FullEmergency => Err(Error::ContractPaused),
+/// The flags a global level imposes.
+///
+/// - `Unpaused`: none.
+/// - `CreationOnly`: creations and deposits, as before. Withdrawals stay open.
+/// - `FullEmergency`: every flag, the footprint the level has always carried.
+pub fn global_flags(level: PauseType) -> PauseFlags {
+    match level {
+        PauseType::Unpaused => PauseFlags::empty(),
+        PauseType::CreationOnly => PauseFlags::PAUSE_DEPOSITS.union(PauseFlags::PAUSE_CREATIONS),
+        PauseType::FullEmergency => PauseFlags::ALL,
     }
 }
 
-/// The pause gate: `Err(ContractPaused)` while the factory is halted in any pause level.
+/// The granular overlay stored under `DataKey::PauseFlags`. Missing or
+/// unrecognised bits read as empty.
+pub fn granular_flags(env: &Env) -> PauseFlags {
+    let bits: u32 = env
+        .storage()
+        .instance()
+        .get(&DataKey::PauseFlags)
+        .unwrap_or(0);
+    PauseFlags::from_bits(bits & PauseFlags::ALL.bits()).unwrap_or(PauseFlags::empty())
+}
+
+/// Writes the granular overlay. Leaves the global level untouched.
+pub fn set_granular_flags(env: &Env, flags: PauseFlags) {
+    env.storage()
+        .instance()
+        .set(&DataKey::PauseFlags, &flags.bits());
+}
+
+/// Everything currently paused: the global level's footprint plus the overlay.
+pub fn effective_flags(env: &Env) -> PauseFlags {
+    global_flags(pause_level(env)).union(granular_flags(env))
+}
+
+/// Rejects new stream creation while `PAUSE_DEPOSITS` or `PAUSE_CREATIONS` is in effect.
+///
+/// The factory has no deposit-free creation path, so both flags block the
+/// same entry points today. `PAUSE_DEPOSITS` is the one that will also cover
+/// top-ups once the stream contract reads these flags.
+pub fn require_creation_allowed(env: &Env) -> Result<(), Error> {
+    let blocked = PauseFlags::PAUSE_DEPOSITS.union(PauseFlags::PAUSE_CREATIONS);
+    if effective_flags(env).intersects(blocked) {
+        Err(Error::ContractPaused)
+    } else {
+        Ok(())
+    }
+}
+
+/// The global pause gate used by the governor-only upgrade path: `Err(ContractPaused)`
+/// while the global level is anything but `Unpaused`. Granular flags do not
+/// block it, which keeps a partial pause from freezing upgrades.
 pub fn require_not_paused(env: &Env) -> Result<(), Error> {
     match pause_level(env) {
         PauseType::Unpaused => Ok(()),
@@ -68,11 +128,16 @@ pub fn require_not_paused(env: &Env) -> Result<(), Error> {
     }
 }
 
-/// Rejects if full emergency pause is active, allowing operations during CreationOnly.
+/// Rejects while `PAUSE_WITHDRAWALS` is in effect.
+///
+/// Not called from inside this crate yet. Withdrawals execute on the stream
+/// contract, which does not read factory state, so the flag is advisory until
+/// that cross-contract read is wired. See `NOTES.md`.
 #[allow(dead_code)]
 pub fn require_withdrawals_allowed(env: &Env) -> Result<(), Error> {
-    match pause_level(env) {
-        PauseType::FullEmergency => Err(Error::ContractPaused),
-        _ => Ok(()),
+    if effective_flags(env).intersects(PauseFlags::PAUSE_WITHDRAWALS) {
+        Err(Error::ContractPaused)
+    } else {
+        Ok(())
     }
 }

@@ -94,17 +94,25 @@ pub struct ProposalVeto {
     pub timestamp: u64,
 }
 
-/// Protocol administration roles.
+/// Protocol administration roles with hierarchy enforcement (Issue #907).
 ///
 /// Each role gates a distinct slice of governor state, so independent wallets
 /// can own fee policy and rate/duration bounds without sharing a single
-/// all-powerful key:
+/// all-powerful key. Roles are organized in a hierarchy to prevent governance
+/// capture via compromised sub-admin keys:
 ///
-/// - `Admin`       — grant and revoke roles (including `Admin` itself).
+/// **Hierarchy (highest to lowest):**
+/// - `SuperAdmin`  — grant/revoke all roles including `SuperAdmin` itself (highest tier).
+/// - `Admin`       — grant and revoke roles except `SuperAdmin` (standard admin, cannot revoke super-admins).
 /// - `FeeManager`  — `set_fee_bps`, `set_fee_recipient`.
 /// - `RateManager` — `set_max_rate`, `set_min_duration`.
 /// - `Pauser`      — `governor_pause`, `governor_unpause`, `pause_factory`, `unpause_factory`.
-/// - `Executor`    — execute proposals after their timelock and quorum checks.
+/// - `Executor`    — execute proposals after their timelock and quorum checks (lowest tier).
+///
+/// **Revocation rules:**
+/// - Only `SuperAdmin` can revoke `SuperAdmin` or `Admin` roles.
+/// - `Admin` can revoke any role except `SuperAdmin` and other `Admin` roles.
+/// - Lower roles (`FeeManager`, `RateManager`, `Pauser`, `Executor`) can be revoked by `Admin` or `SuperAdmin`.
 ///
 /// A role may be held by any number of accounts, and one account may hold any
 /// combination of roles.
@@ -115,11 +123,14 @@ pub struct ProposalVeto {
 #[contracttype]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role {
+    SuperAdmin,
     Admin,
     FeeManager,
     RateManager,
     Pauser,
     Executor,
+    /// May emergency-cancel queued (Pending or Active) proposals (Issue #968).
+    SecurityGuardian,
 }
 
 /// Composite key identifying a single (role, account) grant.
@@ -155,6 +166,9 @@ pub enum DataKey {
     /// Presence marks that `account` holds `role`. The stored value is an
     /// unused `bool`; membership is expressed entirely by the key existing.
     Role(RoleKey),
+    /// Number of accounts currently holding `Role::SuperAdmin`. Tracked so the last
+    /// super-admin can never be revoked, maintaining ultimate governance authority.
+    SuperAdminCount,
     /// Number of accounts currently holding `Role::Admin`. Tracked so the last
     /// admin can never be revoked, which would freeze governance permanently.
     AdminCount,
@@ -210,10 +224,8 @@ pub enum DataKey {
     VoteRecord(u64),
     /// Abstain-vote tally for proposal `u64`.
     ProposalAbstainVotes(u64),
-    /// Veto record for proposal `u64` (Issue #909).
-    ProposalVetoRecord(u64),
-    /// Token supply at proposal snapshot for dynamic quorum calculations (Issue #910).
-    ProposalTokenSupplySnapshot(u64),
+    /// Timelock delay in seconds between proposal creation and execution (Issue #967).
+    TimelockDelaySecs,
 }
 
 /// Adds `proposal_id` to the status index for `status` if it is not present.

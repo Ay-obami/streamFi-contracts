@@ -78,4 +78,6 @@ pub enum Error {
     InvalidFee = 38,
     /// The optional stream metadata URI exceeds 128 bytes (Issue #923).
     MetadataUriTooLong = 39,
+    /// `set_pause_flags` was given bits outside `PauseFlags::ALL` (Issue #975).
+    InvalidPauseFlags = 40,
 }

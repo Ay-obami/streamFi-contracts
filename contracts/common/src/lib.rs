@@ -9,7 +9,7 @@ pub mod testutils;
 pub mod ttl;
 
 pub use ttl::{
-    bump_instance_ttl, bump_persistent_ttl, bump_persistent_with_reward,
+    bump_instance_ttl, bump_persistent_ttl, bump_persistent_with_reward, check_and_bump_ttl,
     configure_keeper_reward_pool, ensure_active_ttl, fund_keeper_reward_pool, keeper_reward_pool,
     KeeperRewardError, KeeperRewardPool, TtlConfig, DEFAULT_KEEPER_REWARD_PER_KEY,
     EXTEND_TTL_LEDGERS, MAINNET_EXTEND_TTL_LEDGERS, MAINNET_MIN_TTL_LEDGERS, MAINNET_TTL_CONFIG,

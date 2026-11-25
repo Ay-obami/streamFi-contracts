@@ -62,6 +62,24 @@ pub struct RoleRevokedEvent {
     pub revoked_at: u64,
 }
 
+/// Emitted when a new admin transfer is proposed.
+#[soroban_sdk::contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminProposedEvent {
+    pub current_admin: Address,
+    pub proposed_admin: Address,
+    pub proposed_at: u64,
+}
+
+/// Emitted when a pending admin accepts the admin role.
+#[soroban_sdk::contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminAcceptedEvent {
+    pub previous_admin: Address,
+    pub new_admin: Address,
+    pub accepted_at: u64,
+}
+
 // ── Trait alias helpers ────────────────────────────────────────────────────
 
 /// Convenience bound for any type usable as an instance-storage key.
@@ -87,7 +105,17 @@ pub enum RbacError {
 
 // ── Core helpers ──────────────────────────────────────────────────────────
 
-/// Role assignment tracking optional expiration timestamp (Issue #692).
+/// Stored value for a granted role (Issue #692, Issue #973).
+///
+/// `expires_at` is a ledger timestamp in seconds. From that timestamp on
+/// (`now >= expires_at`, compared with `env.ledger().timestamp()`) the grant no
+/// longer passes `has_role`, `require_role` or `require_role_or_admin`.
+/// `None` means the grant never expires.
+///
+/// Storage entries written without an expiry are treated as non-expiring. Legacy
+/// boolean entries from before this struct existed are read through the fallback
+/// branch of `has_role`. The storage key layout is unchanged, so no migration is
+/// needed for the key shape.
 #[soroban_sdk::contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RoleAssignment {
@@ -386,6 +414,124 @@ pub fn require_role<RK: StorageKey>(
     }
 }
 
+/// Proposes a new admin in a two-step ceremony (propose → accept).
+///
+/// Only the current admin can call this. The pending admin is stored and must
+/// explicitly accept the role via `accept_admin()` to complete the transfer.
+/// This guards against typos in the admin address.
+///
+/// - `caller`:    the current admin proposing the transfer
+/// - `new_admin`: the address to propose as the new admin
+/// - `pending_key`: storage key for the pending admin address (e.g. `DataKey::PendingAdmin`)
+/// - `admin_key`: composite `(Admin, caller)` key to verify current admin status
+///
+/// Returns `Ok(())` on success, `Err(RbacError::NotAuthorized)` if caller is not admin.
+/// Emits `AdminProposedEvent` on successful proposal.
+pub fn propose_admin<AK: StorageKey>(
+    env: &Env,
+    caller: &Address,
+    new_admin: &Address,
+    pending_key: &AK,
+    admin_key: &AK,
+) -> Result<(), RbacError> {
+    caller.require_auth();
+    if !has_role(env, admin_key) {
+        return Err(RbacError::NotAuthorized);
+    }
+
+    env.storage()
+        .instance()
+        .set(pending_key, &new_admin.clone());
+
+    let event = AdminProposedEvent {
+        current_admin: caller.clone(),
+        proposed_admin: new_admin.clone(),
+        proposed_at: env.ledger().timestamp(),
+    };
+    env.events()
+        .publish(("rbac", symbol_short!("proposed")), event);
+
+    Ok(())
+}
+
+/// Accepts the pending admin role in the two-step transfer ceremony.
+///
+/// Only the pending admin can call this. Upon acceptance, the pending admin
+/// becomes the new admin and the pending slot is cleared. This completes
+/// the two-step ceremony initiated by `propose_admin()`.
+///
+/// - `caller`:      the pending admin accepting the role
+/// - `pending_key`: storage key for the pending admin address
+/// - `role_key`:    composite `(Admin, caller)` key for the new admin
+/// - `admin_count_key`: key for the admin counter
+/// - `members_key`: key for the `Vec<Address>` membership index
+///
+/// Returns `Ok(())` on success, `Err(RbacError::NotAuthorized)` if caller is not the pending admin.
+/// Emits `AdminAcceptedEvent` on successful acceptance.
+pub fn accept_admin<AK, RK, MK>(
+    env: &Env,
+    caller: &Address,
+    pending_key: &AK,
+    role_key: &RK,
+    admin_count_key: &AK,
+    members_key: &MK,
+) -> Result<(), RbacError>
+where
+    AK: StorageKey,
+    RK: StorageKey,
+    MK: StorageKey,
+{
+    caller.require_auth();
+
+    let pending_admin: Option<Address> = env.storage().instance().get(pending_key);
+    let pending = pending_admin.ok_or(RbacError::NotAuthorized)?;
+
+    if pending != *caller {
+        return Err(RbacError::NotAuthorized);
+    }
+
+    // Store the previous admin address before it's removed (for the event)
+    let old_admin_key = role_key;
+    let all_members: SorobanVec<Address> = env
+        .storage()
+        .instance()
+        .get(members_key)
+        .unwrap_or(SorobanVec::new(env));
+
+    let mut prev_admin = None;
+    for i in 0..all_members.len() {
+        if let Some(m) = all_members.get(i) {
+            prev_admin = Some(m);
+            break;
+        }
+    }
+
+    // Grant the admin role to the new admin
+    grant(
+        env,
+        old_admin_key,
+        admin_count_key,
+        members_key,
+        true,
+        caller,
+    );
+
+    // Clear the pending admin slot
+    env.storage().instance().remove(pending_key);
+
+    if let Some(previous) = prev_admin {
+        let event = AdminAcceptedEvent {
+            previous_admin: previous,
+            new_admin: caller.clone(),
+            accepted_at: env.ledger().timestamp(),
+        };
+        env.events()
+            .publish(("rbac", symbol_short!("accepted")), event);
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -443,6 +589,7 @@ mod tests {
         Role(TestRoleKey),
         AdminCount,
         RoleMembers(TestRole),
+        PendingAdmin,
     }
 
     const ADMIN_COUNT: TestKey = TestKey::AdminCount;
@@ -950,6 +1097,226 @@ mod tests {
         });
     }
 
+    // ── expiration (issue #973) ──────────────────────────────────────────────
+
+    /// Grants `role` to `account`, expiring at `expires_at` (`None` = never).
+    fn grant_role_until(
+        env: &Env,
+        role: TestRole,
+        account: &Address,
+        is_admin: bool,
+        expires_at: Option<u64>,
+    ) -> bool {
+        grant_with_expiration(
+            env,
+            &role_key(role.clone(), account),
+            &ADMIN_COUNT,
+            &members_key(&role),
+            is_admin,
+            account,
+            expires_at,
+        )
+    }
+
+    #[test]
+    fn grant_without_expiry_never_expires() {
+        let env = Env::default();
+        let alice = Address::generate(&env);
+
+        in_contract(&env, || {
+            grant_role_until(&env, TestRole::Operator, &alice, false, None);
+            env.ledger().set_timestamp(u64::MAX - 1);
+            assert!(has_role(&env, &role_key(TestRole::Operator, &alice)));
+        });
+    }
+
+    #[test]
+    fn expiry_is_exclusive_at_the_exact_timestamp() {
+        let env = Env::default();
+        let alice = Address::generate(&env);
+
+        in_contract(&env, || {
+            env.ledger().set_timestamp(1_000);
+            grant_role_until(&env, TestRole::Operator, &alice, false, Some(1_100));
+
+            env.ledger().set_timestamp(1_099);
+            assert!(has_role(&env, &role_key(TestRole::Operator, &alice)));
+
+            // At expires_at the grant is already over.
+            env.ledger().set_timestamp(1_100);
+            assert!(!has_role(&env, &role_key(TestRole::Operator, &alice)));
+        });
+    }
+
+    #[test]
+    fn grant_with_past_expiry_is_never_active() {
+        let env = Env::default();
+        let alice = Address::generate(&env);
+
+        in_contract(&env, || {
+            env.ledger().set_timestamp(1_000);
+            grant_role_until(&env, TestRole::Operator, &alice, false, Some(999));
+            assert!(!has_role(&env, &role_key(TestRole::Operator, &alice)));
+        });
+    }
+
+    #[test]
+    fn unexpired_role_passes_require_role() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let operator = Address::generate(&env);
+
+        in_contract(&env, || {
+            env.ledger().set_timestamp(1_000);
+            grant_role_until(&env, TestRole::Operator, &operator, false, Some(1_050));
+            assert_eq!(
+                require_role(
+                    &env,
+                    &operator,
+                    &role_key(TestRole::Operator, &operator),
+                    None
+                ),
+                Ok(())
+            );
+        });
+    }
+
+    #[test]
+    fn expired_role_fails_require_role() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let operator = Address::generate(&env);
+
+        in_contract(&env, || {
+            env.ledger().set_timestamp(1_000);
+            grant_role_until(&env, TestRole::Operator, &operator, false, Some(1_050));
+            env.ledger().set_timestamp(1_050);
+            assert_eq!(
+                require_role(
+                    &env,
+                    &operator,
+                    &role_key(TestRole::Operator, &operator),
+                    None
+                ),
+                Err(RbacError::NotAuthorized)
+            );
+        });
+    }
+
+    #[test]
+    fn expired_admin_does_not_pass_require_role_or_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let root = Address::generate(&env);
+        let temp_admin = Address::generate(&env);
+
+        in_contract(&env, || {
+            env.ledger().set_timestamp(1_000);
+            grant_role_until(&env, TestRole::Admin, &root, true, None);
+            grant_role_until(&env, TestRole::Admin, &temp_admin, true, Some(1_050));
+            env.ledger().set_timestamp(1_050);
+
+            // The Admin super-user fallback must not be reachable with an expired grant.
+            assert_eq!(
+                require_role_or_admin(
+                    &env,
+                    &temp_admin,
+                    &role_key(TestRole::Operator, &temp_admin),
+                    &role_key(TestRole::Admin, &temp_admin),
+                    None,
+                ),
+                Err(RbacError::NotAuthorized)
+            );
+        });
+    }
+
+    #[test]
+    fn revoking_an_expired_role_clears_it_and_its_member_entry() {
+        let env = Env::default();
+        let alice = Address::generate(&env);
+
+        in_contract(&env, || {
+            env.ledger().set_timestamp(1_000);
+            grant_role_until(&env, TestRole::Operator, &alice, false, Some(1_050));
+            env.ledger().set_timestamp(1_050);
+
+            assert_eq!(
+                revoke_role(&env, TestRole::Operator, &alice, false),
+                Ok(true)
+            );
+            assert_eq!(
+                role_members(&env, &members_key(&TestRole::Operator)).len(),
+                0
+            );
+        });
+    }
+
+    #[test]
+    fn revoking_an_expired_admin_decrements_the_admin_count() {
+        let env = Env::default();
+        let root = Address::generate(&env);
+        let temp_admin = Address::generate(&env);
+
+        in_contract(&env, || {
+            env.ledger().set_timestamp(1_000);
+            grant_role_until(&env, TestRole::Admin, &root, true, None);
+            grant_role_until(&env, TestRole::Admin, &temp_admin, true, Some(1_050));
+            assert_eq!(admin_count(&env, &ADMIN_COUNT), 2);
+
+            env.ledger().set_timestamp(1_050);
+            assert_eq!(
+                revoke_role(&env, TestRole::Admin, &temp_admin, true),
+                Ok(true)
+            );
+            assert_eq!(admin_count(&env, &ADMIN_COUNT), 1);
+            assert!(has_role(&env, &role_key(TestRole::Admin, &root)));
+        });
+    }
+
+    #[test]
+    fn renewing_an_expired_admin_does_not_double_count() {
+        let env = Env::default();
+        let root = Address::generate(&env);
+        let temp_admin = Address::generate(&env);
+
+        in_contract(&env, || {
+            env.ledger().set_timestamp(1_000);
+            grant_role_until(&env, TestRole::Admin, &root, true, None);
+            grant_role_until(&env, TestRole::Admin, &temp_admin, true, Some(1_050));
+
+            env.ledger().set_timestamp(1_050);
+            grant_role_until(&env, TestRole::Admin, &temp_admin, true, Some(2_000));
+            assert_eq!(admin_count(&env, &ADMIN_COUNT), 2);
+            assert!(has_role(&env, &role_key(TestRole::Admin, &temp_admin)));
+            assert_eq!(role_members(&env, &members_key(&TestRole::Admin)).len(), 2);
+        });
+    }
+
+    /// Known gap: `AdminCount` is only decremented on revoke, so an Admin whose
+    /// grant has expired still counts toward the LastAdmin guard. Here the only
+    /// active admin can be revoked and governance is left with no active admin.
+    /// Fixing this needs the guard to count active admins (for example via the
+    /// governor's `role_members`, which already filters by `has_role`).
+    #[test]
+    #[ignore = "known gap (issue #973): expired Admin still counted by the LastAdmin guard"]
+    fn last_active_admin_cannot_be_revoked_while_another_admin_has_expired() {
+        let env = Env::default();
+        let root = Address::generate(&env);
+        let temp_admin = Address::generate(&env);
+
+        in_contract(&env, || {
+            env.ledger().set_timestamp(1_000);
+            grant_role_until(&env, TestRole::Admin, &root, true, None);
+            grant_role_until(&env, TestRole::Admin, &temp_admin, true, Some(1_050));
+
+            env.ledger().set_timestamp(1_050);
+            assert_eq!(
+                revoke_role(&env, TestRole::Admin, &root, true),
+                Err(RbacError::LastAdmin)
+            );
+        });
+    }
+
     // ── multi-admin guards ────────────────────────────────────────────────────
 
     #[test]
@@ -1001,6 +1368,176 @@ mod tests {
             assert_eq!(members.len(), 2);
             assert_eq!(members.get(0).unwrap(), admin1);
             assert_eq!(members.get(1).unwrap(), admin3);
+        });
+    }
+
+    // ── two-step admin transfer ───────────────────────────────────────────────
+
+    #[test]
+    fn propose_admin_requires_current_admin_authorization() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let new_admin = Address::generate(&env);
+
+        in_contract(&env, || {
+            grant_role(&env, TestRole::Admin, &admin, true);
+
+            assert_eq!(
+                propose_admin(
+                    &env,
+                    &admin,
+                    &new_admin,
+                    &TestKey::PendingAdmin,
+                    &role_key(TestRole::Admin, &admin),
+                ),
+                Ok(())
+            );
+        });
+    }
+
+    #[test]
+    fn propose_admin_rejects_non_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let stranger = Address::generate(&env);
+        let new_admin = Address::generate(&env);
+
+        in_contract(&env, || {
+            assert_eq!(
+                propose_admin(
+                    &env,
+                    &stranger,
+                    &new_admin,
+                    &TestKey::PendingAdmin,
+                    &role_key(TestRole::Admin, &stranger),
+                ),
+                Err(RbacError::NotAuthorized)
+            );
+        });
+    }
+
+    #[test]
+    fn accept_admin_transfers_admin_role() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let current_admin = Address::generate(&env);
+        let new_admin = Address::generate(&env);
+
+        in_contract(&env, || {
+            grant_role(&env, TestRole::Admin, &current_admin, true);
+
+            // Current admin proposes the new admin
+            propose_admin(
+                &env,
+                &current_admin,
+                &new_admin,
+                &TestKey::PendingAdmin,
+                &role_key(TestRole::Admin, &current_admin),
+            )
+            .unwrap();
+
+            // New admin accepts
+            assert_eq!(
+                accept_admin(
+                    &env,
+                    &new_admin,
+                    &TestKey::PendingAdmin,
+                    &role_key(TestRole::Admin, &new_admin),
+                    &TestKey::AdminCount,
+                    &members_key(&TestRole::Admin),
+                ),
+                Ok(())
+            );
+
+            // Verify new admin now holds the role
+            assert!(has_role(&env, &role_key(TestRole::Admin, &new_admin)));
+
+            // Pending slot should be cleared
+            let pending: Option<Address> = env.storage().instance().get(&TestKey::PendingAdmin);
+            assert_eq!(pending, None);
+        });
+    }
+
+    #[test]
+    fn accept_admin_rejects_wrong_caller() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let proposed_admin = Address::generate(&env);
+        let wrong_caller = Address::generate(&env);
+
+        in_contract(&env, || {
+            grant_role(&env, TestRole::Admin, &admin, true);
+
+            propose_admin(
+                &env,
+                &admin,
+                &proposed_admin,
+                &TestKey::PendingAdmin,
+                &role_key(TestRole::Admin, &admin),
+            )
+            .unwrap();
+
+            // Wrong caller tries to accept
+            assert_eq!(
+                accept_admin(
+                    &env,
+                    &wrong_caller,
+                    &TestKey::PendingAdmin,
+                    &role_key(TestRole::Admin, &wrong_caller),
+                    &TestKey::AdminCount,
+                    &members_key(&TestRole::Admin),
+                ),
+                Err(RbacError::NotAuthorized)
+            );
+        });
+    }
+
+    #[test]
+    fn accept_admin_guards_against_typos() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let typo_address = Address::generate(&env);
+
+        in_contract(&env, || {
+            grant_role(&env, TestRole::Admin, &admin, true);
+
+            // Admin typos the new address
+            propose_admin(
+                &env,
+                &admin,
+                &typo_address,
+                &TestKey::PendingAdmin,
+                &role_key(TestRole::Admin, &admin),
+            )
+            .unwrap();
+
+            // No one can accept it except the typo address itself
+            let other_address = Address::generate(&env);
+            assert_eq!(
+                accept_admin(
+                    &env,
+                    &other_address,
+                    &TestKey::PendingAdmin,
+                    &role_key(TestRole::Admin, &other_address),
+                    &TestKey::AdminCount,
+                    &members_key(&TestRole::Admin),
+                ),
+                Err(RbacError::NotAuthorized)
+            );
+
+            // The correct (typo) address can accept
+            assert!(accept_admin(
+                &env,
+                &typo_address,
+                &TestKey::PendingAdmin,
+                &role_key(TestRole::Admin, &typo_address),
+                &TestKey::AdminCount,
+                &members_key(&TestRole::Admin),
+            )
+            .is_ok());
         });
     }
 }

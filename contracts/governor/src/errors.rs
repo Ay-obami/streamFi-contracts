@@ -45,4 +45,6 @@ pub enum Error {
     AdminTransferAlreadyInProgress = 20,
     /// Proposal stake configuration is missing or invalid.
     ProposalStakeNotConfigured = 21,
+    /// Quorum not reached - insufficient turnout (distinct from ProposalDefeated).
+    QuorumNotReached = 22,
 }

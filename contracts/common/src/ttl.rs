@@ -100,6 +100,20 @@ pub const TTL_THRESHOLD: u32 = MIN_TTL_LEDGERS;
 /// Legacy alias for [`EXTEND_TTL_LEDGERS`].
 pub const TTL_EXTEND_TO: u32 = EXTEND_TTL_LEDGERS;
 
+/// Default instance storage TTL threshold (in ledgers) before extension occurs.
+///
+/// Equivalent to [`MIN_TTL_LEDGERS`]. Used for naming consistency across
+/// protocol contracts (stream, vault, batch-processor) to enforce uniform
+/// storage expiration policies.
+pub const DEFAULT_INSTANCE_THRESHOLD: u32 = MIN_TTL_LEDGERS;
+
+/// Default instance storage TTL bump target (in ledgers) when extended.
+///
+/// Equivalent to [`EXTEND_TTL_LEDGERS`]. Used for naming consistency across
+/// protocol contracts (stream, vault, batch-processor) to enforce uniform
+/// storage expiration policies.
+pub const DEFAULT_INSTANCE_BUMP: u32 = EXTEND_TTL_LEDGERS;
+
 /// Extends the contract's instance storage TTL to [`EXTEND_TTL_LEDGERS`] whenever
 /// the remaining TTL drops below [`MIN_TTL_LEDGERS`].
 ///
@@ -284,6 +298,26 @@ macro_rules! ensure_active_ttl {
     };
 }
 
+/// Extends the instance TTL to `bump_to` only when the remaining TTL is at or
+/// below `threshold`, so a call that finds the TTL still healthy does nothing.
+///
+/// Both values are ledger counts, the same units as [`bump_instance`].
+///
+/// # Panics
+/// Panics when `bump_to < threshold`. Such a pair can never leave the entry
+/// above the threshold after a bump, so it is a caller bug rather than a
+/// state to tolerate silently.
+///
+/// # Implementation note
+/// The current instance TTL is not read here. The Soroban SDK (21.x) exposes
+/// `get_ttl` only in `testutils`, so the threshold check is delegated to
+/// `extend_ttl`, which the host applies only while the TTL is below the
+/// threshold. See NOTES.md for the boundary and this limitation.
+pub fn check_and_bump_ttl(env: &Env, threshold: u32, bump_to: u32) {
+    assert!(bump_to >= threshold, "bump_to must be >= threshold");
+    env.storage().instance().extend_ttl(threshold, bump_to);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,5 +442,106 @@ mod tests {
         assert_eq!(testnet::EXTEND_TTL_LEDGERS, TESTNET_EXTEND_TTL_LEDGERS);
         assert_eq!(mainnet::MIN_TTL_LEDGERS, MAINNET_MIN_TTL_LEDGERS);
         assert_eq!(mainnet::EXTEND_TTL_LEDGERS, MAINNET_EXTEND_TTL_LEDGERS);
+    }
+}
+
+#[cfg(test)]
+mod check_and_bump_ttl_tests {
+    use super::*;
+    use soroban_sdk::{
+        contract, contractimpl,
+        testutils::{storage::Instance as _, Address as _, Ledger as _},
+    };
+
+    #[contract]
+    pub struct TtlProbeContract;
+
+    #[contractimpl]
+    impl TtlProbeContract {}
+
+    /// Forces the instance TTL to exactly `ttl` ledgers from the current ledger.
+    /// `extend_ttl(u32::MAX, ttl)` always applies because the TTL is below u32::MAX.
+    fn set_instance_ttl(env: &Env, contract: &Address, ttl: u32) {
+        env.as_contract(contract, || {
+            env.storage().instance().extend_ttl(u32::MAX, ttl);
+        });
+    }
+
+    fn instance_ttl(env: &Env, contract: &Address) -> u32 {
+        env.as_contract(contract, || env.storage().instance().get_ttl())
+    }
+
+    fn run_check(env: &Env, contract: &Address, threshold: u32, bump_to: u32) {
+        env.as_contract(contract, || check_and_bump_ttl(env, threshold, bump_to));
+    }
+
+    #[test]
+    fn above_threshold_leaves_ttl_unchanged() {
+        let env = Env::default();
+        let contract = env.register_contract(None, TtlProbeContract);
+        set_instance_ttl(&env, &contract, 10_000);
+
+        run_check(&env, &contract, 5_000, 20_000);
+
+        assert_eq!(instance_ttl(&env, &contract), 10_000);
+    }
+
+    #[test]
+    fn one_ledger_above_threshold_leaves_ttl_unchanged() {
+        let env = Env::default();
+        let contract = env.register_contract(None, TtlProbeContract);
+        set_instance_ttl(&env, &contract, 5_001);
+
+        run_check(&env, &contract, 5_000, 20_000);
+
+        assert_eq!(instance_ttl(&env, &contract), 5_001);
+    }
+
+    #[test]
+    fn below_threshold_extends_to_bump_to() {
+        let env = Env::default();
+        let contract = env.register_contract(None, TtlProbeContract);
+        set_instance_ttl(&env, &contract, 4_999);
+
+        run_check(&env, &contract, 5_000, 20_000);
+
+        assert_eq!(instance_ttl(&env, &contract), 20_000);
+    }
+
+    /// Boundary case: remaining TTL exactly equal to `threshold`.
+    /// Expected to extend, matching `contracts/batch-processor/src/ttl.rs`
+    /// ("at or below"). NOT confirmed against the host; see NOTES.md.
+    #[test]
+    fn equal_to_threshold_extends_to_bump_to() {
+        let env = Env::default();
+        let contract = env.register_contract(None, TtlProbeContract);
+        set_instance_ttl(&env, &contract, 5_000);
+
+        run_check(&env, &contract, 5_000, 20_000);
+
+        assert_eq!(instance_ttl(&env, &contract), 20_000);
+    }
+
+    #[test]
+    fn second_call_after_bump_is_a_no_op_while_above_threshold() {
+        let env = Env::default();
+        let contract = env.register_contract(None, TtlProbeContract);
+        set_instance_ttl(&env, &contract, 1_000);
+
+        run_check(&env, &contract, 5_000, 20_000);
+        assert_eq!(instance_ttl(&env, &contract), 20_000);
+
+        env.ledger().with_mut(|li| li.sequence_number += 1);
+        run_check(&env, &contract, 5_000, 20_000);
+
+        assert_eq!(instance_ttl(&env, &contract), 19_999);
+    }
+
+    #[test]
+    #[should_panic(expected = "bump_to must be >= threshold")]
+    fn bump_to_below_threshold_is_rejected() {
+        let env = Env::default();
+        let contract = env.register_contract(None, TtlProbeContract);
+        run_check(&env, &contract, 5_000, 4_999);
     }
 }

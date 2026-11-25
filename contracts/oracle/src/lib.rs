@@ -4462,6 +4462,87 @@ mod tests {
         );
     }
 
+    // Circuit-breaker and failover coverage:
+    // - #978 secondary feed when the primary is stale:
+    //   test_fallback_oracle_feed_automatic_failover
+    // - #979 deviation threshold between consecutive updates:
+    //   test_price_deviation_circuit_breaker,
+    //   hard_oracle_deviation_limit_rejects_moves_over_fifty_percent
+    // - #980 volatility spikes:
+    //   volatility_spike_is_rejected_and_keeps_last_accepted_price,
+    //   gradual_decline_passes_the_breaker_but_the_same_move_in_one_jump_does_not
+    fn volatility_config() -> OracleConfig {
+        OracleConfig {
+            decimals: 8,
+            asset_peg: 1,
+            max_staleness: 300,
+            max_price: 0,
+            min_submit_interval: 0,
+            min_submitters: 1,
+        }
+    }
+
+    #[test]
+    fn volatility_spike_is_rejected_and_keeps_last_accepted_price() {
+        let (env, client, admin) = setup();
+        client.initialize(&admin);
+        let feeder = Address::generate(&env);
+        client.grant_role(&admin, &Role::PriceFeeder, &feeder);
+        client.configure_oracle(&admin, &volatility_config());
+        client.submit_price(&feeder, &100_000_000);
+        // 1000 bps = 10%.
+        client.set_max_deviation_bps(&admin, &1000);
+
+        // A 50% crash is inside the hard 50% limit but over the configured 10%.
+        assert_eq!(
+            client.try_submit_price(&feeder, &50_000_000),
+            Err(Ok(Error::ExcessivePriceDeviation))
+        );
+        assert_eq!(client.latest_price().price, 100_000_000);
+
+        // A 60% crash is over the hard limit as well.
+        assert_eq!(
+            client.try_submit_price(&feeder, &40_000_000),
+            Err(Ok(Error::OracleDeviationTooHigh))
+        );
+        assert_eq!(client.latest_price().price, 100_000_000);
+
+        // A 100% spike up is rejected too, and the stored price is untouched.
+        assert_eq!(
+            client.try_submit_price(&feeder, &200_000_000),
+            Err(Ok(Error::OracleDeviationTooHigh))
+        );
+        assert_eq!(client.latest_price().price, 100_000_000);
+
+        // Back inside the band, the feed accepts updates again.
+        assert!(client.try_submit_price(&feeder, &105_000_000).is_ok());
+        assert_eq!(client.latest_price().price, 105_000_000);
+    }
+
+    #[test]
+    fn gradual_decline_passes_the_breaker_but_the_same_move_in_one_jump_does_not() {
+        let (env, client, admin) = setup();
+        client.initialize(&admin);
+        let feeder = Address::generate(&env);
+        client.grant_role(&admin, &Role::PriceFeeder, &feeder);
+        client.configure_oracle(&admin, &volatility_config());
+        client.submit_price(&feeder, &100_000_000);
+        client.set_max_deviation_bps(&admin, &1000);
+
+        // 27.1% in one update is far over the 10% breaker.
+        assert_eq!(
+            client.try_submit_price(&feeder, &72_900_000),
+            Err(Ok(Error::ExcessivePriceDeviation))
+        );
+
+        // The same total move in three steps of exactly 10% each is accepted,
+        // because every update is compared with the previous accepted price.
+        for price in [90_000_000u64, 81_000_000, 72_900_000] {
+            assert!(client.try_submit_price(&feeder, &price).is_ok());
+        }
+        assert_eq!(client.latest_price().price, 72_900_000);
+    }
+
     #[test]
     fn test_fallback_oracle_feed_automatic_failover() {
         let (env, client, admin) = setup();

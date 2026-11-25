@@ -5,7 +5,8 @@
 //! that do not require an actual stream deployment (which needs the stream
 //! WASM to be built first).
 
-use drip_factory::{DripFactory, DripFactoryClient, Error};
+use drip_common::pause::PauseFlags;
+use drip_factory::{DripFactory, DripFactoryClient, Error, PauseType};
 use drip_governor::{DripGovernor, DripGovernorClient};
 use soroban_sdk::{
     testutils::{storage::Instance as _, Address as _, Ledger, LedgerInfo},
@@ -244,4 +245,126 @@ fn governor_pause_factory_and_unpause_factory_flow() {
     // Governor unpauses factory
     governor_client.unpause_factory(&authority);
     assert!(!factory_client.is_paused());
+}
+
+// ── Granular pause flags (Issue #975) ──────────────────────────────────────────
+
+/// Attempts a fully valid `create_stream`, so the only reason it can be
+/// rejected is a pause.
+macro_rules! try_create {
+    ($env:expr, $client:expr) => {{
+        let sender = Address::generate($env);
+        let recip = Address::generate($env);
+        let token = make_token($env, &sender, 1_000_000);
+        let now = $env.ledger().timestamp();
+        $client.try_create_stream(
+            &sender,
+            &recip,
+            &token,
+            &1_000_000,
+            &100,
+            &now,
+            &(now + 7_200),
+            &false,
+            &None,
+            &None,
+        )
+    }};
+}
+
+#[test]
+fn pause_deposits_blocks_creation_but_not_withdrawals() {
+    let env = base_env();
+    let client = deploy_factory(&env);
+    client.set_pause_flags(&PauseFlags::PAUSE_DEPOSITS.bits());
+
+    assert_eq!(client.pause_flags(), PauseFlags::PAUSE_DEPOSITS.bits());
+    // A granular flag must not flip the global pause.
+    assert!(!client.is_paused());
+    assert_eq!(try_create!(&env, &client), Err(Ok(Error::ContractPaused)));
+    // Withdrawals stay open under a deposit lock.
+    assert_eq!(client.pause_flags() & PauseFlags::PAUSE_WITHDRAWALS.bits(), 0);
+}
+
+#[test]
+fn pause_withdrawals_blocks_only_the_withdrawal_flag() {
+    let env = base_env();
+    let client = deploy_factory(&env);
+    client.set_pause_flags(&PauseFlags::PAUSE_WITHDRAWALS.bits());
+
+    assert_eq!(client.pause_flags(), PauseFlags::PAUSE_WITHDRAWALS.bits());
+    assert_eq!(client.pause_flags() & PauseFlags::PAUSE_DEPOSITS.bits(), 0);
+    assert!(!client.is_paused());
+    // Creation is unaffected by a withdrawal-only pause.
+    assert_ne!(try_create!(&env, &client), Err(Ok(Error::ContractPaused)));
+}
+
+#[test]
+fn global_pause_still_blocks_creation_and_sets_every_flag() {
+    let env = base_env();
+    let client = deploy_factory(&env);
+    client.pause();
+
+    assert!(client.is_paused());
+    assert_eq!(client.pause_flags(), PauseFlags::ALL.bits());
+    assert_eq!(try_create!(&env, &client), Err(Ok(Error::ContractPaused)));
+}
+
+#[test]
+fn clearing_granular_flags_cannot_lift_a_global_pause() {
+    let env = base_env();
+    let client = deploy_factory(&env);
+    client.pause();
+    client.set_pause_flags(&0);
+
+    assert!(client.is_paused());
+    assert_eq!(client.pause_flags(), PauseFlags::ALL.bits());
+    assert_eq!(try_create!(&env, &client), Err(Ok(Error::ContractPaused)));
+}
+
+#[test]
+fn creation_only_level_blocks_creation_and_keeps_withdrawals_open() {
+    let env = base_env();
+    let client = deploy_factory(&env);
+    client.pause_with_level(&PauseType::CreationOnly);
+
+    let expected = PauseFlags::PAUSE_DEPOSITS.union(PauseFlags::PAUSE_CREATIONS);
+    assert_eq!(client.pause_flags(), expected.bits());
+    assert_eq!(client.pause_flags() & PauseFlags::PAUSE_WITHDRAWALS.bits(), 0);
+    assert!(client.is_paused());
+    assert_eq!(try_create!(&env, &client), Err(Ok(Error::ContractPaused)));
+}
+
+#[test]
+fn unpause_restores_creation_and_clears_global_flags() {
+    let env = base_env();
+    let client = deploy_factory(&env);
+    client.pause();
+    client.unpause();
+
+    assert!(!client.is_paused());
+    assert_eq!(client.pause_flags(), 0);
+    assert_ne!(try_create!(&env, &client), Err(Ok(Error::ContractPaused)));
+}
+
+#[test]
+fn unpause_keeps_explicitly_set_granular_flags() {
+    let env = base_env();
+    let client = deploy_factory(&env);
+    client.set_pause_flags(&PauseFlags::PAUSE_DEPOSITS.bits());
+    client.pause();
+    client.unpause();
+
+    assert_eq!(client.pause_flags(), PauseFlags::PAUSE_DEPOSITS.bits());
+    assert_eq!(try_create!(&env, &client), Err(Ok(Error::ContractPaused)));
+}
+
+#[test]
+fn set_pause_flags_rejects_unknown_bits() {
+    let env = base_env();
+    let client = deploy_factory(&env);
+
+    let result = client.try_set_pause_flags(&(1u32 << 31));
+    assert_eq!(result, Err(Ok(Error::InvalidPauseFlags)));
+    assert_eq!(client.pause_flags(), 0);
 }

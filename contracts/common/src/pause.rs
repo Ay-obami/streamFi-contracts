@@ -41,6 +41,46 @@ pub enum PausedError {
     ContractPaused,
 }
 
+/// Operation class for granular pause checks (Issue #1020).
+///
+/// Pass to [`require_operation_not_paused`] to enforce per-operation gate
+/// without reading flags the caller does not need.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum PauseOperation {
+    /// New stream creation (`PauseFlags::PAUSE_CREATIONS`).
+    CreateStream,
+    /// Recipient withdrawal (`PauseFlags::PAUSE_WITHDRAWALS`).
+    Withdraw,
+    /// Deposit / fund intake (`PauseFlags::PAUSE_DEPOSITS`).
+    Deposit,
+}
+
+/// Granular gate: `Ok(())` when `operation` is not blocked by any active flag.
+///
+/// Preserves recipient access to already-vested funds during maintenance:
+///
+/// ```ignore
+/// // Block new streams but keep withdrawals open:
+/// let flags = PauseFlags::PAUSE_CREATIONS;
+/// require_operation_not_paused(flags, PauseOperation::CreateStream)?; // → Err
+/// require_operation_not_paused(flags, PauseOperation::Withdraw)?;     // → Ok
+/// ```
+pub fn require_operation_not_paused(
+    flags: PauseFlags,
+    operation: PauseOperation,
+) -> Result<(), PausedError> {
+    let blocked = match operation {
+        PauseOperation::CreateStream => flags.contains(PauseFlags::PAUSE_CREATIONS),
+        PauseOperation::Withdraw => flags.contains(PauseFlags::PAUSE_WITHDRAWALS),
+        PauseOperation::Deposit => flags.contains(PauseFlags::PAUSE_DEPOSITS),
+    };
+    if blocked {
+        Err(PausedError::ContractPaused)
+    } else {
+        Ok(())
+    }
+}
+
 /// Detailed pause state for emergency pause.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -286,6 +326,73 @@ pub fn require_not_paused_flag(paused: bool) -> Result<(), PausedError> {
         Err(PausedError::ContractPaused)
     } else {
         Ok(())
+    }
+}
+
+/// Granular pause flags for the protocol's three protected operation classes
+/// (Issue #975).
+///
+/// A bitfield so each class can be halted independently of the others:
+///
+/// - [`PauseFlags::PAUSE_DEPOSITS`] blocks intake of new funds (deposit-bearing
+///   stream creation, and top-ups once the stream side is wired to it).
+/// - [`PauseFlags::PAUSE_WITHDRAWALS`] blocks recipient withdrawals.
+/// - [`PauseFlags::PAUSE_CREATIONS`] blocks deployment of new stream contracts.
+///
+/// Cancellations are deliberately not covered by any flag: a cancel returns
+/// the recipient's vested share and the sender's refund, so gating it would
+/// trap funds in exactly the way the blanket pause does today. See `NOTES.md`.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub struct PauseFlags(u32);
+
+impl PauseFlags {
+    /// Blocks deposit intake.
+    pub const PAUSE_DEPOSITS: Self = Self(1 << 0);
+    /// Blocks withdrawals; deposits and creations are unaffected by this bit.
+    pub const PAUSE_WITHDRAWALS: Self = Self(1 << 1);
+    /// Blocks deployment of new stream contracts.
+    pub const PAUSE_CREATIONS: Self = Self(1 << 2);
+    /// Every defined flag set together.
+    pub const ALL: Self = Self(Self::PAUSE_DEPOSITS.0 | Self::PAUSE_WITHDRAWALS.0 | Self::PAUSE_CREATIONS.0);
+
+    /// No flags set: nothing is paused.
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    /// The raw bit representation, as stored and exposed on-chain.
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    /// Builds flags from raw bits. Returns `None` when any bit outside
+    /// [`PauseFlags::ALL`] is set, so a typo cannot silently pause nothing.
+    pub fn from_bits(bits: u32) -> Option<Self> {
+        if bits & !Self::ALL.0 == 0 {
+            Some(Self(bits))
+        } else {
+            None
+        }
+    }
+
+    /// Union of two flag sets.
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// True when every flag in `other` is set in `self`.
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// True when at least one flag in `other` is set in `self`.
+    pub const fn intersects(self, other: Self) -> bool {
+        self.0 & other.0 != 0
+    }
+
+    /// True when no flag is set.
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
     }
 }
 
@@ -568,3 +675,100 @@ mod tests {
         });
     }
 }
+
+#[cfg(test)]
+mod pause_flag_tests {
+    use super::PauseFlags;
+
+    #[test]
+    fn flags_are_distinct_single_bits_and_all_covers_them() {
+        let mut seen = 0u32;
+        for f in [
+            PauseFlags::PAUSE_DEPOSITS,
+            PauseFlags::PAUSE_WITHDRAWALS,
+            PauseFlags::PAUSE_CREATIONS,
+        ] {
+            assert_eq!(f.bits().count_ones(), 1);
+            assert_eq!(seen & f.bits(), 0);
+            seen |= f.bits();
+        }
+        assert_eq!(PauseFlags::ALL.bits(), seen);
+    }
+
+    #[test]
+    fn default_and_empty_are_nothing_paused() {
+        assert!(PauseFlags::default().is_empty());
+        assert_eq!(PauseFlags::default(), PauseFlags::empty());
+    }
+
+    #[test]
+    fn from_bits_rejects_unknown_bits() {
+        assert_eq!(PauseFlags::from_bits(0), Some(PauseFlags::empty()));
+        assert_eq!(
+            PauseFlags::from_bits(PauseFlags::ALL.bits()),
+            Some(PauseFlags::ALL)
+        );
+        assert_eq!(PauseFlags::from_bits(1 << 31), None);
+        assert_eq!(PauseFlags::from_bits(PauseFlags::ALL.bits() | 1 << 3), None);
+    }
+
+    #[test]
+    fn union_contains_and_intersects_follow_bitwise_semantics() {
+        let dep = PauseFlags::PAUSE_DEPOSITS;
+        let wd = PauseFlags::PAUSE_WITHDRAWALS;
+        let both = dep.union(wd);
+        assert!(both.contains(dep));
+        assert!(both.contains(wd));
+        assert!(!dep.contains(wd));
+        assert!(both.intersects(wd));
+        assert!(!dep.intersects(wd));
+        assert!(!PauseFlags::empty().intersects(PauseFlags::ALL));
+    }
+
+    #[test]
+    fn operation_pause_allows_withdrawals_while_creations_are_blocked() {
+        // Issue #1020: granular pause — block new streams but keep withdrawals open.
+        let flags = PauseFlags::PAUSE_CREATIONS;
+        assert_eq!(
+            require_operation_not_paused(flags, PauseOperation::CreateStream),
+            Err(PausedError::ContractPaused),
+        );
+        assert_eq!(
+            require_operation_not_paused(flags, PauseOperation::Withdraw),
+            Ok(()),
+        );
+        assert_eq!(
+            require_operation_not_paused(flags, PauseOperation::Deposit),
+            Ok(()),
+        );
+    }
+
+    #[test]
+    fn all_flags_blocks_every_operation() {
+        for op in [
+            PauseOperation::CreateStream,
+            PauseOperation::Withdraw,
+            PauseOperation::Deposit,
+        ] {
+            assert_eq!(
+                require_operation_not_paused(PauseFlags::ALL, op),
+                Err(PausedError::ContractPaused),
+            );
+        }
+    }
+
+    #[test]
+    fn empty_flags_allows_every_operation() {
+        for op in [
+            PauseOperation::CreateStream,
+            PauseOperation::Withdraw,
+            PauseOperation::Deposit,
+        ] {
+            assert_eq!(
+                require_operation_not_paused(PauseFlags::empty(), op),
+                Ok(()),
+            );
+        }
+    }
+}
+ 

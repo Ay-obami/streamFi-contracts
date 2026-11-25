@@ -439,3 +439,106 @@ pub fn get_streams_by_recipient(
     }
     addrs
 }
+
+/// Appends a newly deployed stream address to the reverse-lookup index for
+/// `token` (Issue #900). Called from `create_stream_with_config`, so batch
+/// creation is covered through the same path.
+pub fn append_token_index(env: &Env, token: &Address, stream_address: &Address) {
+    let key = DataKey::StreamsByToken(token.clone());
+    let mut streams: Vec<Address> = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or(Vec::new(env));
+    streams.push_back(stream_address.clone());
+    env.storage().persistent().set(&key, &streams);
+    extend_ttl(env, &key);
+}
+
+/// Returns a paginated window of the stream addresses deployed for `token`,
+/// in creation order (Issue #900). `limit` is clamped to [`query::MAX_PAGE_SIZE`].
+/// An unknown token yields an empty vector.
+pub fn get_streams_by_token(
+    env: &Env,
+    token: Address,
+    start_index: u32,
+    limit: u32,
+) -> Vec<Address> {
+    let key = DataKey::StreamsByToken(token);
+    match env.storage().persistent().get::<_, Vec<Address>>(&key) {
+        Some(streams) => {
+            extend_ttl(env, &key);
+            query::paginate_addresses(env, streams, start_index, limit)
+        }
+        None => Vec::new(env),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::DripFactory;
+    use soroban_sdk::testutils::Address as _;
+
+    #[test]
+    fn token_index_records_streams_in_creation_order() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, DripFactory);
+        let token = Address::generate(&env);
+        let a = Address::generate(&env);
+        let b = Address::generate(&env);
+
+        env.as_contract(&contract_id, || {
+            append_token_index(&env, &token, &a);
+            append_token_index(&env, &token, &b);
+
+            assert_eq!(
+                get_streams_by_token(&env, token.clone(), 0, 10),
+                soroban_sdk::vec![&env, a.clone(), b.clone()]
+            );
+        });
+    }
+
+    #[test]
+    fn token_index_is_scoped_to_each_token() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, DripFactory);
+        let token_a = Address::generate(&env);
+        let token_b = Address::generate(&env);
+        let stream = Address::generate(&env);
+
+        env.as_contract(&contract_id, || {
+            append_token_index(&env, &token_a, &stream);
+
+            assert_eq!(
+                get_streams_by_token(&env, token_a.clone(), 0, 10),
+                soroban_sdk::vec![&env, stream.clone()]
+            );
+            assert!(get_streams_by_token(&env, token_b.clone(), 0, 10).is_empty());
+        });
+    }
+
+    #[test]
+    fn token_index_paginates_by_offset_and_limit() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, DripFactory);
+        let token = Address::generate(&env);
+        let streams: [Address; 3] = [
+            Address::generate(&env),
+            Address::generate(&env),
+            Address::generate(&env),
+        ];
+
+        env.as_contract(&contract_id, || {
+            for s in streams.iter() {
+                append_token_index(&env, &token, s);
+            }
+
+            assert_eq!(
+                get_streams_by_token(&env, token.clone(), 1, 1),
+                soroban_sdk::vec![&env, streams[1].clone()]
+            );
+            assert!(get_streams_by_token(&env, token.clone(), 3, 10).is_empty());
+        });
+    }
+}
